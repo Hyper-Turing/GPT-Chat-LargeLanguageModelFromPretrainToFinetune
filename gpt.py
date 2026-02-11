@@ -295,8 +295,8 @@ class GPT(nn.Module):
     
     def forward(self, idx, targets=None, kv_cache: Optional[KVCache] = None):
         """
-          wte → LN → [Block x n_layer] → ln_f → lm_head
-          支持KV Cache
+        wte → LN → [Block x n_layer] → ln_f → lm_head
+        支持KV Cache
         """
         B, T = idx.size()
 
