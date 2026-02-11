@@ -31,6 +31,7 @@ MAX_NEW_TOKENS = 512
 TEMPERATURE = 0.7
 TOP_K = 50
 TOP_P = 0.9
+USE_KV_CACHE = True  # 启用 KV Cache 提升生成速度
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16 if (DEVICE == "cuda" and torch.cuda.is_bf16_supported()) else torch.float16
@@ -79,6 +80,7 @@ def load_model():
     total = sum(p.numel() for p in model.parameters()) / 1e6
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
     print(f"  总参数: {total:.1f}M, 可训练: {trainable:.1f}M")
+    print(f"  KV Cache: {'启用' if USE_KV_CACHE else '禁用'}")
 
     return model, tokenizer
 
@@ -117,6 +119,7 @@ def chat_once(prompt, model, tokenizer, history=None):
         do_sample=True,  # 启用采样
         eos_token_id=stop_ids,  # 传入 list
         pad_token_id=tokenizer.pad_token_id,
+        use_kv_cache=USE_KV_CACHE,
     )
 
     # 只解码新生成的部分
