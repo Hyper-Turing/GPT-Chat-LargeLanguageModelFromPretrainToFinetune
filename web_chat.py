@@ -66,166 +66,54 @@ def load_model():
 model, tokenizer = load_model()
 
 # ============================================================
-#  推理
+#  推理 (简化版，直接使用 gpt.generate)
 # ============================================================
-def apply_repetition_penalty(logits, generated_ids, penalty):
-    """对已生成过的 token 施加重复惩罚, logits shape: [vocab_size]"""
-    if penalty == 1.0 or len(generated_ids) == 0:
-        return logits
-    unique_ids = list(set(generated_ids))
-    score = logits[unique_ids]
-    score = torch.where(score > 0, score / penalty, score * penalty)
-    logits[unique_ids] = score
-    return logits
-
-
-def detect_repetition(ids, min_pattern=8, max_check=100):
-    """检测最近生成的 token 是否陷入循环"""
-    if len(ids) < min_pattern * 2:
-        return False
-    recent = ids[-max_check:]
-    for plen in range(min_pattern, len(recent) // 2 + 1):
-        pattern = recent[-plen:]
-        prev = recent[-2 * plen:-plen]
-        if pattern == prev:
-            return True
-    return False
-
-
-def trim_verbose(text):
-    """截断重复/废话尾巴：在最后一个完整句结束处截断"""
-    if len(text) < 80:
-        return text
-
-    # 找重复段落
-    for sep in ['。', '！', '？', '\n']:
-        text = text.replace(sep, sep + '\x00')
-    parts = [s.strip() for s in text.split('\x00') if s.strip()]
-
-    seen = set()
-    result = []
-    for part in parts:
-        key = part.replace('，', '').replace('。', '').replace('！', '').replace('？', '').strip()
-        if len(key) > 10 and key in seen:
-            break
-        if len(key) > 10:
-            seen.add(key)
-        result.append(part)
-
-    trimmed = ''.join(result)
-
-    cut_patterns = [
-        "如果您还有", "如果你还有", "如果有任何", "希望我能",
-        "请随时告诉", "感谢您的", "祝您好运", "期待下次",
-        "如果您想", "如果你想讨论", "欢迎继续", "请继续提问",
-    ]
-    for pat in cut_patterns:
-        idx = trimmed.find(pat)
-        if idx > 20:
-            trimmed = trimmed[:idx].rstrip('，,、 ')
-            break
-
-    return trimmed.strip()
-
-
-def sample_token(logits_2d):
-    """从 [1, vocab] 的 logits 中采样一个 token，返回 [1, 1] tensor"""
-    if TEMPERATURE > 0:
-        logits_2d = logits_2d / TEMPERATURE
-
-    if TOP_K > 0:
-        v, _ = torch.topk(logits_2d, min(TOP_K, logits_2d.size(-1)))
-        logits_2d[logits_2d < v[:, [-1]]] = -float("Inf")
-
-    if TOP_P < 1.0:
-        sorted_logits, sorted_idx = torch.sort(logits_2d, descending=True)
-        cum_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-        remove = cum_probs > TOP_P
-        remove[:, 1:] = remove[:, :-1].clone()
-        remove[:, 0] = False
-        indices_to_remove = remove.scatter(1, sorted_idx, remove)
-        logits_2d[indices_to_remove] = -float("Inf")
-
-    probs = torch.softmax(logits_2d, dim=-1)
-    return torch.multinomial(probs, num_samples=1)  # [1, 1]
-
-
 def generate_reply(messages):
+    # 构造对话文本
     text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    ids = torch.tensor([tokenizer.encode(text)], dtype=torch.long, device=DEVICE)
-    inp_len = ids.shape[1]
-
+    input_ids = torch.tensor([tokenizer.encode(text)], dtype=torch.long, device=DEVICE)
+    
+    # 准备 stop token IDs
     stop_ids = [tokenizer.eos_token_id]
     for t in ["<|im_end|>", "<|endoftext|>"]:
         tid = tokenizer.convert_tokens_to_ids(t)
         if tid != tokenizer.unk_token_id:
             stop_ids.append(tid)
 
-    generated = []
     with lock:
-        if USE_KV_CACHE:
-            # ---- KV Cache 模式 ----
-            total_len = inp_len + MAX_NEW_TOKENS
-            kv_cache = model._create_kv_cache(1, total_len, DEVICE, DTYPE)
+        # 直接使用 gpt.generate 生成回复
+        output = model.generate(
+            input_ids,
+            max_new_tokens=MAX_NEW_TOKENS,
+            temperature=TEMPERATURE,
+            top_k=TOP_K,
+            top_p=TOP_P,
+            eos_token_id=stop_ids,
+            pad_token_id=tokenizer.pad_token_id,
+            use_kv_cache=USE_KV_CACHE,
+        )
 
-            # Prefill: 一次性处理所有输入 token
-            logits, _ = model(ids, kv_cache=kv_cache)
-
-            for _ in range(MAX_NEW_TOKENS):
-                next_logits = logits[:, -1, :]  # [1, vocab]
-
-                # 重复惩罚
-                next_logits[0] = apply_repetition_penalty(next_logits[0], generated, REPETITION_PENALTY)
-
-                # 采样
-                next_id = sample_token(next_logits)  # [1, 1]
-                token_id = next_id.item()
-                generated.append(token_id)
-
-                # EOS 检查
-                if token_id in stop_ids:
-                    break
-
-                # 重复循环检测
-                if len(generated) > 30 and detect_repetition(generated):
-                    break
-
-                # Decode step: 只送入新 token，KV Cache 自动拼接历史
-                logits, _ = model(next_id, kv_cache=kv_cache)
-
-        else:
-            # ---- 无 Cache 模式（原始实现）----
-            for _ in range(MAX_NEW_TOKENS):
-                idx_cond = ids if ids.size(1) <= model.config.max_seq_len else ids[:, -model.config.max_seq_len:]
-                logits, _ = model(idx_cond)
-                logits = logits[:, -1, :]  # [1, vocab]
-
-                # 重复惩罚
-                logits[0] = apply_repetition_penalty(logits[0], generated, REPETITION_PENALTY)
-
-                # 采样
-                next_id = sample_token(logits)  # [1, 1]
-                ids = torch.cat([ids, next_id], dim=1)
-
-                token_id = next_id.item()
-                generated.append(token_id)
-
-                if token_id in stop_ids:
-                    break
-
-                if len(generated) > 30 and detect_repetition(generated):
-                    break
-
+    # 解码新生成的部分
+    input_len = input_ids.shape[1]
+    new_ids = output[0][input_len:].tolist()
+    
     # 截断 stop token
     for sid in stop_ids:
-        if sid in generated:
-            generated = generated[:generated.index(sid)]
-
-    resp = tokenizer.decode(generated, skip_special_tokens=True)
-    for tag in ["<|im_end|>", "<|endoftext|>", "<|im_start|>"]:
+        if sid in new_ids:
+            new_ids = new_ids[:new_ids.index(sid)]
+            break
+    
+    # 解码并清理
+    resp = tokenizer.decode(new_ids, skip_special_tokens=True)
+    
+    # 截断特殊标记
+    for tag in ["<|im_end|>", "<|endoftext|>", "<|im_start|>", "_typeDefinition", "_类型定义", "_类型解释", "typeDefinition"]:
         if tag in resp:
             resp = resp[:resp.index(tag)]
-    resp = trim_verbose(resp)
+    
+    # 清理可能的尾部垃圾
+    resp = resp.rstrip(" _~`\"'")
+    
     return resp.strip()
 
 # ============================================================
@@ -240,352 +128,68 @@ HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>GPT Chat</title>
 <style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { 
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
-    background: #ffffff; 
-    color: #374151; 
-    height: 100vh; 
-    display: flex; 
-    flex-direction: column; 
-  }
-  
-  .header { 
-    padding: 16px 20px; 
-    background: #ffffff; 
-    border-bottom: 1px solid #e5e7eb; 
-    text-align: center;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
-  }
-  
-  .header h1 { 
-    font-size: 20px; 
-    color: #374151;
-    font-weight: 600;
-  }
-  
-  .header p { 
-    font-size: 13px; 
-    color: #6b7280; 
-    margin-top: 2px; 
-  }
-  
-  #chat { 
-    flex: 1; 
-    overflow-y: auto; 
-    padding: 20px; 
-    background: #f9fafb;
-    display: flex; 
-    flex-direction: column; 
-    gap: 8px;  /* 减小间距 */
-  }
-  
-  .msg { 
-    max-width: 85%; 
-    padding: 12px 16px; 
-    border-radius: 12px; 
-    line-height: 1.5; 
-    font-size: 15px; 
-    white-space: pre-wrap; 
-    word-break: break-word; 
-    animation: fadeIn .3s ease;
-  }
-  
-  .user { 
-    align-self: flex-end; 
-    background: #3b82f6; 
-    color: white; 
-    margin-left: auto;
-    border-radius: 12px 12px 4px 12px;
-  }
-  
-  .bot { 
-    align-self: flex-start; 
-    background: white; 
-    color: #374151; 
-    border: 1px solid #e5e7eb;
-    border-radius: 12px 12px 12px 4px;
-    box-shadow: 0 1px 2px rgba(0,0,0,0.03);
-  }
-  
-  .bot pre { 
-    background: #f3f4f6; 
-    padding: 10px 12px; 
-    border-radius: 6px; 
-    overflow-x: auto; 
-    margin: 8px 0; 
-    font-size: 14px; 
-    border: 1px solid #e5e7eb;
-  }
-  
-  .bot code { 
-    font-family: 'SF Mono', 'Monaco', 'Consolas', monospace; 
-    font-size: 13.5px; 
-    color: #dc2626;
-    background: #fef2f2;
-    padding: 2px 4px;
-    border-radius: 3px;
-  }
-  
-  .typing { 
-    align-self: flex-start; 
-    padding: 12px 16px; 
-    background: white; 
-    border: 1px solid #e5e7eb; 
-    border-radius: 12px 12px 12px 4px;
-    box-shadow: 0 1px 2px rgba(0,0,0,0.03);
-    display: flex;
-    align-items: center;
-    gap: 6px;
-  }
-  
-  .typing-dots {
-    display: flex;
-    gap: 4px;
-  }
-  
-  .typing span { 
-    display: inline-block; 
-    width: 6px; 
-    height: 6px; 
-    background: #9ca3af; 
-    border-radius: 50%; 
-    animation: pulse 1.4s infinite ease-in-out;
-  }
-  
-  .typing span:nth-child(1) { animation-delay: -0.32s; }
-  .typing span:nth-child(2) { animation-delay: -0.16s; }
-  
-  @keyframes pulse {
-    0%, 80%, 100% { opacity: 0; }
-    40% { opacity: 1; }
-  }
-  
-  @keyframes fadeIn { 
-    from { opacity: 0; transform: translateY(4px); } 
-    to { opacity: 1; transform: translateY(0); } 
-  }
-  
-  .input-area { 
-    padding: 16px 20px; 
-    background: white; 
-    border-top: 1px solid #e5e7eb; 
-    display: flex; 
-    gap: 10px; 
-    align-items: flex-end;
-  }
-  
-  #input { 
-    flex: 1; 
-    padding: 12px 16px; 
-    border-radius: 12px; 
-    border: 1px solid #d1d5db; 
-    background: white; 
-    color: #374151; 
-    font-size: 15px; 
-    outline: none; 
-    resize: none; 
-    max-height: 120px; 
-    font-family: inherit;
-    transition: border-color 0.2s;
-  }
-  
-  #input:focus { 
-    border-color: #3b82f6; 
-    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
-  }
-  
-  #input::placeholder {
-    color: #9ca3af;
-  }
-  
-  #send { 
-    padding: 0 20px; 
-    height: 42px;
-    border-radius: 12px; 
-    border: none; 
-    background: #3b82f6; 
-    color: white; 
-    font-size: 14px; 
-    font-weight: 500;
-    cursor: pointer; 
-    transition: background-color 0.2s;
-  }
-  
-  #send:hover { 
-    background: #2563eb; 
-  }
-  
-  #send:disabled { 
-    background: #9ca3af; 
-    cursor: not-allowed; 
-  }
-  
-  #clear { 
-    padding: 0 16px; 
-    height: 42px;
-    border-radius: 12px; 
-    border: 1px solid #d1d5db; 
-    background: white; 
-    color: #6b7280; 
-    font-size: 14px; 
-    cursor: pointer; 
-    transition: all 0.2s;
-  }
-  
-  #clear:hover { 
-    border-color: #3b82f6; 
-    color: #3b82f6; 
-    background: #f8fafc;
-  }
-  
-  /* 滚动条样式 */
-  #chat::-webkit-scrollbar {
-    width: 6px;
-  }
-  
-  #chat::-webkit-scrollbar-track {
-    background: #f1f1f1;
-    border-radius: 3px;
-  }
-  
-  #chat::-webkit-scrollbar-thumb {
-    background: #c1c1c1;
-    border-radius: 3px;
-  }
-  
-  #chat::-webkit-scrollbar-thumb:hover {
-    background: #a8a8a8;
-  }
-  
-  /* 响应式调整 */
-  @media (max-width: 768px) {
-    .msg { max-width: 90%; }
-    #input { font-size: 16px; } /* 移动端输入法优化 */
-  }
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: system-ui, sans-serif; height: 100vh; display: flex; flex-direction: column; }
+.header { padding: 16px; background: #fff; border-bottom: 1px solid #e5e7eb; text-align: center; }
+#chat { flex: 1; overflow-y: auto; padding: 20px 10%; background: #f9fafb; display: flex; flex-direction: column; gap: 12px; }
+.msg { max-width: 75%; padding: 12px 16px; border-radius: 12px; line-height: 1.5; font-size: 15px; white-space: pre-wrap; word-break: break-word; }
+.user { align-self: flex-end; background: #3b82f6; color: #fff; border-radius: 12px 12px 4px 12px; }
+.bot { align-self: flex-start; background: #fff; color: #374151; border: 1px solid #e5e7eb; border-radius: 12px 12px 12px 4px; }
+.bot pre { background: #f3f4f6; padding: 10px; border-radius: 6px; overflow-x: auto; margin: 8px 0; font-size: 14px; }
+.bot code { font-family: monospace; font-size: 13px; color: #dc2626; background: #fef2f2; padding: 2px 4px; border-radius: 3px; }
+.typing { align-self: flex-start; padding: 12px 16px; background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; display: flex; gap: 4px; }
+.typing span { width: 6px; height: 6px; background: #9ca3af; border-radius: 50%; animation: p 1.4s infinite; }
+.typing span:nth-child(2) { animation-delay: 0.2s; }
+@keyframes p { 0%, 80%, 100% { opacity: 0.3; } 40% { opacity: 1; } }
+.input-area { padding: 16px 10%; background: #fff; border-top: 1px solid #e5e7eb; display: flex; gap: 10px; }
+#input { flex: 1; padding: 10px 16px; border-radius: 10px; border: 1px solid #d1d5db; font-size: 15px; outline: none; resize: none; min-height: 40px; max-height: 120px; }
+#input:focus { border-color: #3b82f6; }
+#send, #clear { padding: 10px 20px; border-radius: 10px; border: none; font-size: 14px; cursor: pointer; }
+#send { background: #3b82f6; color: #fff; }
+#send:disabled { background: #9ca3af; }
+#clear { background: #fff; color: #6b7280; border: 1px solid #d1d5db; }
+@media (max-width: 768px) { #chat, .input-area { padding: 16px 5%; } .msg { max-width: 85%; } }
 </style>
 </head>
 <body>
-<div class="header">
-  <h1>🤖 GPT Chat</h1>
-  <p>基于 Qwen2.5-1.5B + LoRA SFT 微调</p>
-</div>
+<div class="header"><h3>GPT Chat</h3></div>
 <div id="chat"></div>
 <div class="input-area">
-  <textarea id="input" rows="1" placeholder="输入消息..." onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send()}"></textarea>
-  <button id="send" onclick="send()">发送</button>
-  <button id="clear" onclick="clearChat()">清空</button>
+<textarea id="input" rows="1" placeholder="输入消息..."></textarea>
+<button id="send" onclick="send()">发送</button>
+<button id="clear" onclick="clearChat()">清空</button>
 </div>
 <script>
-const chat = document.getElementById('chat');
-const input = document.getElementById('input');
-const sendBtn = document.getElementById('send');
+const chat = document.getElementById('chat'), input = document.getElementById('input'), sendBtn = document.getElementById('send');
 let history = [];
 
-input.addEventListener('input', function() {
-  this.style.height = 'auto';
-  const maxHeight = 160; // 稍微增加最大高度
-  this.style.height = Math.min(this.scrollHeight, maxHeight) + 'px';
-});
+input.addEventListener('input', () => { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 120) + 'px'; });
+input.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
 
-function addMsg(role, text) {
-  const d = document.createElement('div');
-  d.className = 'msg ' + role;
-  
-  // 处理代码块
-  let html = text
-    .replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>')
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
-    .replace(/\n/g, '<br>');
-  
-  d.innerHTML = html;
-  chat.appendChild(d);
-  chat.scrollTop = chat.scrollHeight;
-  return d;
+function fmt(text) {
+  return text.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>').replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\n/g, '<br>');
 }
-
-function showTyping() {
-  const d = document.createElement('div');
-  d.className = 'typing';
-  d.id = 'typing';
-  
-  const dots = document.createElement('div');
-  dots.className = 'typing-dots';
-  dots.innerHTML = '<span></span><span></span><span></span>';
-  
-  d.appendChild(dots);
-  chat.appendChild(d);
-  chat.scrollTop = chat.scrollHeight;
+function add(role, text) {
+  const d = document.createElement('div'); d.className = 'msg ' + role; d.innerHTML = fmt(text); chat.appendChild(d); chat.scrollTop = chat.scrollHeight;
 }
-
-function hideTyping() {
-  const el = document.getElementById('typing');
-  if (el) el.remove();
-}
+function typing() { const d = document.createElement('div'); d.className = 'typing'; d.id = 't'; d.innerHTML = '<span></span><span></span><span></span>'; chat.appendChild(d); chat.scrollTop = chat.scrollHeight; }
+function hideTyping() { const el = document.getElementById('t'); if (el) el.remove(); }
 
 async function send() {
-  const text = input.value.trim();
-  if (!text) return;
-  
-  input.value = '';
-  input.style.height = 'auto';
-  sendBtn.disabled = true;
-  sendBtn.textContent = '发送中...';
-
-  addMsg('user', text);
-  showTyping();
-
+  const text = input.value.trim(); if (!text) return;
+  input.value = ''; input.style.height = 'auto'; sendBtn.disabled = true;
+  add('user', text); typing();
   try {
-    const res = await fetch('/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: text, history: history })
-    });
-    
-    const data = await res.json();
-    hideTyping();
-
-    if (data.error) {
-      addMsg('bot', '⚠️ ' + data.error);
-    } else {
-      addMsg('bot', data.reply);
-      history.push([text, data.reply]);
-      // 限制历史记录长度
-      if (history.length > 10) history = history.slice(-10);
-    }
-  } catch(e) {
-    hideTyping();
-    addMsg('bot', '⚠️ 请求失败: ' + e.message);
-    console.error('请求错误:', e);
-  }
-  
-  sendBtn.disabled = false;
-  sendBtn.textContent = '发送';
-  input.focus();
+    const res = await fetch('/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: text, history }) });
+    const data = await res.json(); hideTyping();
+    if (data.error) add('bot', '⚠️ ' + data.error);
+    else { add('bot', data.reply); history.push([text, data.reply]); if (history.length > 10) history = history.slice(-10); }
+  } catch(e) { hideTyping(); add('bot', '⚠️ 请求失败'); }
+  sendBtn.disabled = false; input.focus();
 }
 
-function clearChat() {
-  if (chat.children.length === 0) return;
-  
-  if (confirm('确定要清空对话记录吗？')) {
-    history = [];
-    chat.innerHTML = '';
-    input.focus();
-  }
-}
-
-// 页面加载后自动聚焦输入框
-window.addEventListener('load', () => {
-  input.focus();
-});
-
-// 支持 Ctrl+Enter 发送
-input.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && e.ctrlKey) {
-    e.preventDefault();
-    send();
-  }
-});
+function clearChat() { if (!chat.children.length) return; if (confirm('清空对话?')) { history = []; chat.innerHTML = ''; input.focus(); } }
+window.addEventListener('load', () => input.focus());
 </script>
 </body>
 </html>"""
@@ -604,6 +208,11 @@ def chat_api():
             return jsonify({"error": "消息不能为空"})
 
         messages = []
+        messages.append({
+        "role": "system", 
+        "content": "你是一个极度简洁的AI助手。规则：1.只回答核心内容，禁止废话；2.禁止重复和过度解释；3.每个回答控制在30~字以内；4.只陈述事实，适当添加寒暄。"
+    })
+        
         for u, b in hist:
             messages.append({"role": "user", "content": u})
             messages.append({"role": "assistant", "content": b})

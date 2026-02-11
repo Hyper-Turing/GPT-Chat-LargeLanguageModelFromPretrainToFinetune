@@ -27,8 +27,8 @@ LORA_ALPHA = 32
 LORA_TARGETS = {"c_q", "c_v"}
 
 # 生成参数
-MAX_NEW_TOKENS = 512
-TEMPERATURE = 0.7
+MAX_NEW_TOKENS = 128  #
+TEMPERATURE = 0.5     # 降低温度，减少随机发散
 TOP_K = 50
 TOP_P = 0.9
 USE_KV_CACHE = True  # 启用 KV Cache 提升生成速度
@@ -91,6 +91,13 @@ def load_model():
 def chat_once(prompt, model, tokenizer, history=None):
     """单次对话生成"""
     messages = []
+    
+    # 添加 system message 控制输出风格
+    messages.append({
+        "role": "system", 
+        "content": "你是一个极度简洁的AI助手。规则：1.只回答核心内容，禁止废话；2.禁止重复和过度解释；3.每个回答控制在30字以内；4.只陈述事实，适当添加寒暄。"
+    })
+    
     if history:
         for user_msg, bot_msg in history:
             messages.append({"role": "user", "content": user_msg})
@@ -128,8 +135,9 @@ def chat_once(prompt, model, tokenizer, history=None):
 
     # 在 token id 层面截断：遇到 stop token 就截断
     for sid in stop_ids:
-        if sid in new_ids:
-            new_ids = new_ids[:new_ids.index(sid)]
+        matches = (new_ids == sid).nonzero(as_tuple=True)[0]
+        if len(matches) > 0:
+            new_ids = new_ids[:matches[0].item()]
 
     response = tokenizer.decode(new_ids, skip_special_tokens=True)
 

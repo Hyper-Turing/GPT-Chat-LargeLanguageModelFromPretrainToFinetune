@@ -27,9 +27,18 @@ class GPTConfig:
     dropout: float = 0.0
 
     @classmethod
+    # 工厂模式
     def qwen2_5_0_7b(cls):
         return cls(n_layer=28, n_head=28, n_kv_head=4, n_embd=3584,
                    intermediate_size=18944, vocab_size=152064)
+
+"""
+为什么kv_head=4? 
+Attention中kv所占显存=2 * batch_size * kv_head * seq_len * head_dim * n_layers * 2(float16)
+MHA 中 kv_head = n_head = 28
+GQA 中 kv_head = 4
+两者差距 7 倍，显存占用大幅降低
+"""
 
 
 # ======================================================================
@@ -61,7 +70,10 @@ class KVCache:
         self.max_seq_len = max_seq_len
         self.head_dim = head_dim
 
-        # 预分配 (n_layers, B, H, T, D) — 注意 H 和 T 的顺序
+        # 预分配 (n_layers, B, H, T, D)
+        # Transformer中每一层都有独立的kv
+        # 统一使用同一个KVCache对象管理所有层的缓存，而不是每层单独创建对象
+        # 注意 H 和 T 的顺序
         self.k_cache = torch.zeros(
             num_layers, batch_size, num_kv_heads, max_seq_len, head_dim,
             device=device, dtype=dtype
@@ -70,7 +82,7 @@ class KVCache:
             num_layers, batch_size, num_kv_heads, max_seq_len, head_dim,
             device=device, dtype=dtype
         )
-        self.seq_len = 0
+        self.seq_len = 0 # 尾指针
 
     def reset(self):
         """重置缓存"""
@@ -93,7 +105,7 @@ class KVCache:
             k_full: (B, n_kv_head, seq_len + T_new, head_dim)
             v_full: (B, n_kv_head, seq_len + T_new, head_dim)
         """
-        T_new = k_new.size(2)
+        T_new = k_new.size(2) # 新token的数量，prefill时>1
         start = self.seq_len
         end = start + T_new
 
@@ -115,8 +127,8 @@ class KVCache:
 
     def prefill(self, other):
         """
-        从另一个 KVCache 复制数据 (用于批量生成场景:
-        先 batch=1 预填充, 再复制到 batch=N 的缓存中)
+        用于批量生成场景:为同一个问题生成多个答案时
+        先 batch=1 预填充, 再复制到 batch=N 的缓存中
         """
         assert self.seq_len == 0, "Cannot prefill a non-empty KV cache"
         pos = other.seq_len
@@ -211,7 +223,7 @@ class CausalSelfAttention(nn.Module):
             k, v = kv_cache.update(self.layer_idx, k, v) # k, v 现在是 (B, n_kv_head, total_seq_len, head_dim)
 
         # GQA: 复制 KV heads  以匹配 Q heads
-        k = self._repeat_kv(k)  # (B, T, n_head, head_dim)
+        k = self._repeat_kv(k)  # (B, n_head, T, head_dim)
         v = self._repeat_kv(v)
         
         # Attention
@@ -402,8 +414,8 @@ class GPT(nn.Module):
                     next_logits[finished] = -float('Inf')
                     next_logits[finished, pad_token_id] = 0
 
-                # 采样
-                idx_next = self._sample(next_logits, temperature, top_k, top_p, do_sample)
+                # 采样（传入已生成的 token 用于重复惩罚）
+                idx_next = self._sample(next_logits, temperature, top_k, top_p, do_sample, generated=generated)
 
                 generated = torch.cat((generated, idx_next), dim=1)
 
@@ -412,8 +424,12 @@ class GPT(nn.Module):
                     is_eos = (idx_next.squeeze(1).unsqueeze(1) == eos_token_id.unsqueeze(0)).any(dim=1)
                     finished = finished | is_eos
 
-                    # Decode step: 只送入新 token
-                    logits, _ = self.forward(idx_next, kv_cache=kv_cache)
+                # 如果所有序列都结束了，不再执行 forward
+                if finished.all():
+                    break
+
+                # Decode step: 只送入新 token（为下一次迭代准备 logits）
+                logits, _ = self.forward(idx_next, kv_cache=kv_cache)
 
             return generated
 
@@ -431,7 +447,7 @@ class GPT(nn.Module):
                     logits[finished] = -float('Inf')
                     logits[finished, pad_token_id] = 0
                 
-                idx_next = self._sample(logits, temperature, top_k, top_p, do_sample)
+                idx_next = self._sample(logits, temperature, top_k, top_p, do_sample, generated=idx)
                 idx = torch.cat((idx, idx_next), dim=1)
                 
                 if eos_token_id is not None:
@@ -441,8 +457,26 @@ class GPT(nn.Module):
             return idx
         
 
-    def _sample(self, logits, temperature, top_k, top_p, do_sample):
-        """采样辅助函数, 从 logits 中采样下一个 token"""
+    def _sample(self, logits, temperature, top_k, top_p, do_sample, generated=None, repetition_penalty=1.5):
+        """采样辅助函数, 从 logits 中采样下一个 token
+        
+        Args:
+            logits: (B, vocab_size) 的 logits
+            temperature: 温度参数
+            top_k: top-k 采样
+            top_p: nucleus 采样
+            do_sample: 是否采样
+            generated: (B, seq_len) 已生成的 token ids，用于重复惩罚
+            repetition_penalty: 重复惩罚系数，默认 1.5（>1 时降低已生成 token 的概率）
+        """
+        # 应用重复惩罚
+        if generated is not None and repetition_penalty > 1.0:
+            # 获取每个 batch 中已出现的 unique token
+            for i in range(logits.size(0)):
+                unique_tokens = torch.unique(generated[i])
+                # 对已生成的 token 降低 logits
+                logits[i, unique_tokens] /= repetition_penalty
+        
         if do_sample and temperature > 0:
             logits = logits / temperature
 
