@@ -326,12 +326,9 @@ class GPT(nn.Module):
         logits = self.lm_head(x)
 
         if targets is not None:
-            # 需要 shift: logits[t] 预测 targets[t+1]
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = targets[:, 1:].contiguous()
             loss = F.cross_entropy(
-                shift_logits.float().view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
+                logits.float().view(-1, logits.size(-1)),
+                targets.view(-1),
                 ignore_index=-100,
             )
             return logits, loss
@@ -359,6 +356,7 @@ class GPT(nn.Module):
         temperature=1.0, 
         top_k=None, 
         top_p=None,
+        repetition_penalty=1.1,
         do_sample=True,
         eos_token_id=None,
         pad_token_id=None,
@@ -447,7 +445,7 @@ class GPT(nn.Module):
                     logits[finished] = -float('Inf')
                     logits[finished, pad_token_id] = 0
                 
-                idx_next = self._sample(logits, temperature, top_k, top_p, do_sample, generated=idx)
+                idx_next = self._sample(logits, temperature, top_k, top_p, do_sample, generated=idx, repetition_penalty=repetition_penalty)
                 idx = torch.cat((idx, idx_next), dim=1)
                 
                 if eos_token_id is not None:
@@ -457,7 +455,7 @@ class GPT(nn.Module):
             return idx
         
 
-    def _sample(self, logits, temperature, top_k, top_p, do_sample, generated=None, repetition_penalty=1.5):
+    def _sample(self, logits, temperature, top_k, top_p, do_sample, generated=None, repetition_penalty=1.1):
         """采样辅助函数, 从 logits 中采样下一个 token
         
         Args:
@@ -469,13 +467,20 @@ class GPT(nn.Module):
             generated: (B, seq_len) 已生成的 token ids，用于重复惩罚
             repetition_penalty: 重复惩罚系数，默认 1.5（>1 时降低已生成 token 的概率）
         """
-        # 应用重复惩罚
+        # 应用重复惩罚（参考 HuggingFace RepetitionPenaltyLogitsProcessor）
         if generated is not None and repetition_penalty > 1.0:
-            # 获取每个 batch 中已出现的 unique token
             for i in range(logits.size(0)):
                 unique_tokens = torch.unique(generated[i])
-                # 对已生成的 token 降低 logits
-                logits[i, unique_tokens] /= repetition_penalty
+                # 过滤掉特殊 token，不惩罚 stop tokens
+                mask = torch.ones(len(unique_tokens), dtype=torch.bool, device=unique_tokens.device)
+                for sid in [151643, 151645, 151644]:  # endoftext, im_end, im_start
+                    mask &= (unique_tokens != sid)
+                penalize_tokens = unique_tokens[mask]
+                # 正 logits 除以 penalty，负 logits 乘以 penalty
+                scores = logits[i, penalize_tokens]
+                logits[i, penalize_tokens] = torch.where(
+                    scores > 0, scores / repetition_penalty, scores * repetition_penalty
+                )
         
         if do_sample and temperature > 0:
             logits = logits / temperature

@@ -9,6 +9,7 @@ from transformers import AutoTokenizer
 from gpt import GPT, GPTConfig
 from lora import apply_lora, load_lora_weights
 
+import re
 # ============================================================
 #  配置
 # ============================================================
@@ -27,8 +28,8 @@ LORA_ALPHA = 32
 LORA_TARGETS = {"c_q", "c_v"}
 
 # 生成参数
-MAX_NEW_TOKENS = 128  #
-TEMPERATURE = 0.5     # 降低温度，减少随机发散
+MAX_NEW_TOKENS = 512  #
+TEMPERATURE = 0.7     # 降低温度，减少随机发散
 TOP_K = 50
 TOP_P = 0.9
 USE_KV_CACHE = True  # 启用 KV Cache 提升生成速度
@@ -88,14 +89,15 @@ def load_model():
 # ============================================================
 #  对话接口
 # ============================================================
-def chat_once(prompt, model, tokenizer, history=None):
+def chat_once(prompt, model, tokenizer, history=None, debug=False):
     """单次对话生成"""
     messages = []
     
-    # 添加 system message 控制输出风格
+    # 训练时 dataset.py 会自动添加 "You are a helpful assistant."
     messages.append({
-        "role": "system", 
-        "content": "你是一个极度简洁的AI助手。规则：1.只回答核心内容，禁止废话；2.禁止重复和过度解释；3.每个回答控制在30字以内；4.只陈述事实，适当添加寒暄。"
+    "role": "system", 
+    "content": "You are a helpful assistant. You should provide clear, accurate, and concise answers to the user's questions. "
+    "You can answer questions in both Chinese and English. If you don't know the answer, please say so honestly."
     })
     
     if history:
@@ -106,16 +108,40 @@ def chat_once(prompt, model, tokenizer, history=None):
 
     # apply_chat_template 自动处理 <|im_start|> 等标记
     text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    
+    # ========== 调试：打印处理后的文本 ==========
+    if debug:
+        print(f"\n{'='*60}")
+        print("【DEBUG】Prompt 处理详情:")
+        print(f"{'='*60}")
+        print(f"原始 prompt: {repr(prompt)}")
+        print(f"\n历史轮数: {len(history) if history else 0}")
+        if history:
+            for i, (u, a) in enumerate(history):
+                print(f"  轮次 {i+1}: user={repr(u[:30])}... -> assistant={repr(a[:30])}...")
+        print(f"\napply_chat_template 后文本:\n{text}")
+        print(f"\nToken IDs: {tokenizer.encode(text)}")
+        print(f"Token 数: {len(tokenizer.encode(text))}")
+        print(f"{'='*60}")
+    # ============================================
+    
     input_ids = torch.tensor([tokenizer.encode(text)], dtype=torch.long, device=DEVICE)
     input_len = input_ids.shape[1]
 
-    # print(f"  [debug] 输入长度: {input_len} tokens")
     stop_ids = [tokenizer.eos_token_id]
     for t in ["<|im_end|>", "<|endoftext|>"]:
         tid = tokenizer.convert_tokens_to_ids(t)
         if tid != tokenizer.unk_token_id:
             stop_ids.append(tid)
 
+    # ========== 调试：打印生成前的信息 ==========
+    if debug:
+        print(f"\n【DEBUG】生成参数:")
+        print(f"  max_new_tokens={MAX_NEW_TOKENS}, temperature={TEMPERATURE}")
+        print(f"  stop_ids={stop_ids}")
+        print(f"  input_len={input_len}, device={DEVICE}")
+    # ============================================
+    
     # 用 GPT 自带的 generate 方法
     output = model.generate(
         input_ids,
@@ -123,6 +149,7 @@ def chat_once(prompt, model, tokenizer, history=None):
         temperature=TEMPERATURE,
         top_k=TOP_K,
         top_p=TOP_P,
+        repetition_penalty=1.2,
         do_sample=True,  # 启用采样
         eos_token_id=stop_ids,  # 传入 list
         pad_token_id=tokenizer.pad_token_id,
@@ -131,20 +158,41 @@ def chat_once(prompt, model, tokenizer, history=None):
 
     # 只解码新生成的部分
     new_ids = output[0][input_len:]
-    response = tokenizer.decode(new_ids, skip_special_tokens=True)
+    
+    # ========== 调试：打印原始生成的 token ==========
+    if debug:
+        print(f"\n【DEBUG】生成的 Token IDs (前50个):")
+        print(f"  {new_ids[:50].tolist()}")
+        print(f"  解码: {repr(tokenizer.decode(new_ids[:50], skip_special_tokens=False))}")
+    # ============================================
 
     # 在 token id 层面截断：遇到 stop token 就截断
+    stop_position = len(new_ids)
     for sid in stop_ids:
         matches = (new_ids == sid).nonzero(as_tuple=True)[0]
         if len(matches) > 0:
-            new_ids = new_ids[:matches[0].item()]
+            stop_position = min(stop_position, matches[0].item())
+    
+    # 同时检查 <|im_start|>，如果生成新的 user 角色，立即截断
+    im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
+    if im_start_id != tokenizer.unk_token_id:
+        matches = (new_ids == im_start_id).nonzero(as_tuple=True)[0]
+        if len(matches) > 0:
+            stop_position = min(stop_position, matches[0].item())
+            if debug:
+                print(f"  检测到 <|im_start|> 在位置 {matches[0].item()}，提前截断")
+    
+    new_ids = new_ids[:stop_position]
 
     response = tokenizer.decode(new_ids, skip_special_tokens=True)
+    response = re.sub(r'[^\u4e00-\u9fffA-Za-z0-9\s，。！？、；：""''（）《》【】\.\,\!\?\;\:\'\"\(\)\n-]+$', '', response).rstrip()
 
     # 二次兜底：截断残留的特殊标记文本
     for stop_tag in ["<|im_end|>", "<|endoftext|>", "<|im_start|>"]:
         if stop_tag in response:
             response = response[:response.index(stop_tag)]
+            if debug:
+                print(f"  字符串截断: 在 {repr(stop_tag)} 处截断")
 
     return response.strip()
 
@@ -198,9 +246,12 @@ def interactive_chat(model, tokenizer):
     print("\n" + "=" * 60)
     print("  交互式对话 (自定义 GPT)")
     print("  输入 quit 退出, clear 清空历史, test 跑固定测试")
+    print("  输入 debug 切换调试模式（显示 prompt 处理详情）")
     print("=" * 60)
 
     history = []
+    debug_mode = False  # 调试模式开关
+    
     while True:
         try:
             user_input = input("\nYou: ").strip()
@@ -219,8 +270,12 @@ def interactive_chat(model, tokenizer):
         if user_input.lower() == "test":
             test_fixed_prompts(model, tokenizer)
             continue
+        if user_input.lower() == "debug":
+            debug_mode = not debug_mode
+            print(f"  调试模式: {'开启' if debug_mode else '关闭'}")
+            continue
 
-        response = chat_once(user_input, model, tokenizer, history)
+        response = chat_once(user_input, model, tokenizer, history, debug=debug_mode)
         print(f"\nAssistant: {response}")
 
         history.append((user_input, response))
@@ -231,21 +286,16 @@ def interactive_chat(model, tokenizer):
 def main():
     model, tokenizer = load_model()
     # 在 load_model() 之后
-    text = "<|im_start|>user\n你好<|im_end|>\n<|im_start|>assistant\n"
-    input_ids = tokenizer.encode(text, add_special_tokens=False)
-    idx = torch.tensor([input_ids], dtype=torch.long, device=DEVICE)
+    # text = "<|im_start|>user\n你好<|im_end|>\n<|im_start|>assistant\n"
+    # input_ids = tokenizer.encode(text, add_special_tokens=False)
+    # idx = torch.tensor([input_ids], dtype=torch.long, device=DEVICE)
 
-    with torch.no_grad():
-        # 注意：如果你的模型转成了 bf16，确保 idx 在同一设备
-        logits, _ = model(idx)
-        probs = torch.softmax(logits[0, -1, :].float(), dim=-1)  # 转 float 避免精度问题
-        topk_vals, topk_ids = probs.topk(15)
+    # with torch.no_grad():
+    #     # 注意：如果你的模型转成了 bf16，确保 idx 在同一设备
+    #     logits, _ = model(idx)
+    #     probs = torch.softmax(logits[0, -1, :].float(), dim=-1)  # 转 float 避免精度问题
+    #     topk_vals, topk_ids = probs.topk(15)
         
-        print("Top-15 下一个 token 预测:")
-        for v, i in zip(topk_vals, topk_ids):
-            t = tokenizer.decode([i.item()])
-            print(f"  ID={i.item():6d}  prob={v.item():.4f}  text={repr(t)}")
-
     # 先跑固定测试
     # test_fixed_prompts(model, tokenizer)
 
