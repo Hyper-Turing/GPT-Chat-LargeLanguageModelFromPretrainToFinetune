@@ -507,7 +507,7 @@ class GPT(nn.Module):
         return idx_next
     
     @classmethod
-    def from_pretrained(cls, model_name="Qwen/Qwen2.5-7B"):
+    def from_pretrained(cls, model_name="Qwen/Qwen2.5-7B", load_weights=True):
         """
         从 HuggingFace 加载预训练权重:
           HF                                    → GPT
@@ -523,6 +523,10 @@ class GPT(nn.Module):
           model.layers.{i}.post_attention_layernorm.* → transformer.h.{i}.ln_2.*
           model.norm.weight                     → ln_f.weight
           lm_head.weight                        → lm_head.weight
+        
+        Args:
+            model_name: HF 模型名称或路径
+            load_weights: 是否加载 HF 预训练权重 (默认 True)。设为 False 时只创建模型结构。
         """
         from transformers import AutoModelForCausalLM, AutoConfig
 
@@ -548,6 +552,10 @@ class GPT(nn.Module):
 
         # 创建我们的模型（随机初始化）
         model = cls(config)
+
+        if not load_weights:
+            # 仅创建模型结构，不加载 HF 权重（用于断点续训）
+            return model
 
         # 加载 HF 权重
         hf_model = AutoModelForCausalLM.from_pretrained(

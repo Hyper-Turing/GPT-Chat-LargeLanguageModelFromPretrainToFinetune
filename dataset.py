@@ -293,87 +293,87 @@ def sft_data_generator_bos_bestfit(
         yield inputs, targets
 
 
-# =============================================================================
-# 简化版 DataLoader - 无 packing + Qwen label mask
-# =============================================================================
+# # ==========================================================================
+# # 简化版 DataLoader - 无 packing + Qwen label mask
+# # =============================================================================
 
-def sft_data_generator_simple(
-    dataset: SFTDataset,
-    tokenizer: AutoTokenizer,
-    max_seq_len: int,
-    batch_size: int,
-    device: str,
-    shuffle: bool = True,
-):
-    """
-    简化版 SFT dataloader：每行一个对话 + Qwen 官方 label mask
+# def sft_data_generator_simple(
+#     dataset: SFTDataset,
+#     tokenizer: AutoTokenizer,
+#     max_seq_len: int,
+#     batch_size: int,
+#     device: str,
+#     shuffle: bool = True,
+# ):
+#     """
+#     简化版 SFT dataloader：每行一个对话 + Qwen 官方 label mask
     
-    Yields:
-        (inputs, targets): 
-            - inputs: (batch_size, max_seq_len) int32
-            - targets: (batch_size, max_seq_len) int64
-    """
-    assert len(dataset) > 0, "Dataset must not be empty"
+#     Yields:
+#         (inputs, targets): 
+#             - inputs: (batch_size, max_seq_len) int32
+#             - targets: (batch_size, max_seq_len) int64
+#     """
+#     assert len(dataset) > 0, "Dataset must not be empty"
     
-    effective_len = max_seq_len + 1
+#     effective_len = max_seq_len + 1
     
-    pad_token = tokenizer.pad_token_id
-    if pad_token is None:
-        pad_token = tokenizer.eos_token_id
-    assert pad_token is not None
+#     pad_token = tokenizer.pad_token_id
+#     if pad_token is None:
+#         pad_token = tokenizer.eos_token_id
+#     assert pad_token is not None
     
-    indices = list(range(len(dataset)))
+#     indices = list(range(len(dataset)))
     
-    while True:
-        if shuffle:
-            import random
-            random.shuffle(indices)
+#     while True:
+#         if shuffle:
+#             import random
+#             random.shuffle(indices)
         
-        for i in range(0, len(indices), batch_size):
-            batch_indices = indices[i:i + batch_size]
+#         for i in range(0, len(indices), batch_size):
+#             batch_indices = indices[i:i + batch_size]
             
-            rows = []
-            mask_rows = []
-            content_lengths = []
+#             rows = []
+#             mask_rows = []
+#             content_lengths = []
             
-            for idx in batch_indices:
-                tokens, mask = dataset.get_conversation_tokens_with_mask(idx)
+#             for idx in batch_indices:
+#                 tokens, mask = dataset.get_conversation_tokens_with_mask(idx)
                 
-                if len(tokens) > effective_len:
-                    tokens = tokens[:effective_len]
-                    mask = mask[:effective_len]
+#                 if len(tokens) > effective_len:
+#                     tokens = tokens[:effective_len]
+#                     mask = mask[:effective_len]
                 
-                content_len = len(tokens)
+#                 content_len = len(tokens)
                 
-                if content_len < effective_len:
-                    pad_len = effective_len - content_len
-                    tokens = tokens + [pad_token] * pad_len
-                    mask = mask + [0] * pad_len
+#                 if content_len < effective_len:
+#                     pad_len = effective_len - content_len
+#                     tokens = tokens + [pad_token] * pad_len
+#                     mask = mask + [0] * pad_len
                 
-                rows.append(tokens)
-                mask_rows.append(mask)
-                content_lengths.append(content_len)
+#                 rows.append(tokens)
+#                 mask_rows.append(mask)
+#                 content_lengths.append(content_len)
             
-            while len(rows) < batch_size:
-                rows.append(rows[-1] if rows else [pad_token] * effective_len)
-                mask_rows.append(mask_rows[-1] if mask_rows else [0] * effective_len)
-                content_lengths.append(content_lengths[-1] if content_lengths else 0)
+#             while len(rows) < batch_size:
+#                 rows.append(rows[-1] if rows else [pad_token] * effective_len)
+#                 mask_rows.append(mask_rows[-1] if mask_rows else [0] * effective_len)
+#                 content_lengths.append(content_lengths[-1] if content_lengths else 0)
             
-            batch_tensor = torch.tensor(rows, dtype=torch.long)
+#             batch_tensor = torch.tensor(rows, dtype=torch.long)
             
-            inputs = batch_tensor[:, :-1].to(device=device, dtype=torch.int32)
-            targets = batch_tensor[:, 1:].to(device=device, dtype=torch.int64)
+#             inputs = batch_tensor[:, :-1].to(device=device, dtype=torch.int32)
+#             targets = batch_tensor[:, 1:].to(device=device, dtype=torch.int64)
             
-            # 应用 Qwen label mask
-            for i in range(len(content_lengths)):
-                row_mask = mask_rows[i][1:]
-                content_len = content_lengths[i]
+#             # 应用 Qwen label mask
+#             for i in range(len(content_lengths)):
+#                 row_mask = mask_rows[i][1:]
+#                 content_len = content_lengths[i]
                 
-                for j in range(min(len(row_mask), targets.size(1))):
-                    if row_mask[j] == 0:
-                        targets[i, j] = -100
+#                 for j in range(min(len(row_mask), targets.size(1))):
+#                     if row_mask[j] == 0:
+#                         targets[i, j] = -100
                 
-                if content_len < effective_len:
-                    targets[i, content_len-1:] = -100
+#                 if content_len < effective_len:
+#                     targets[i, content_len-1:] = -100
             
-            yield inputs, targets
+#             yield inputs, targets

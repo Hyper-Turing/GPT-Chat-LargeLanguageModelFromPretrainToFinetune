@@ -21,9 +21,12 @@ from contextlib import nullcontext
 import torch
 from transformers import AutoTokenizer
 
+import wandb
+
 from gpt import GPT, GPTConfig
-from dataset import SFTDataset, sft_data_generator_simple, sft_data_generator_bos_bestfit
+from dataset import SFTDataset, sft_data_generator_bos_bestfit
 from lora import apply_lora, mark_only_lora_as_trainable, lora_state_dict, load_lora_weights
+from checkpoint_manager import save_checkpoint, load_checkpoint, resume_from_checkpoint, find_latest_checkpoint
 
 # -----------------------------------------------------------------------------
 # 【命令行参数配置】
@@ -62,6 +65,15 @@ parser.add_argument("--lora-targets", type=str, default="c_q,c_v", help="Comma-s
 # 输出
 parser.add_argument("--out-dir", type=str, default="out/sft", help="Output directory")
 parser.add_argument("--dry-run", action="store_true", help="Skip saving checkpoints")
+# Wandb 参数
+parser.add_argument("--use-wandb", action="store_true", help="Enable wandb logging")
+parser.add_argument("--wandb-project", type=str, default="gpt-chat-sft", help="Wandb project name")
+parser.add_argument("--wandb-run-name", type=str, default=None, help="Wandb run name")
+# Checkpoint 参数
+parser.add_argument("--scratch", action="store_true", default=True, help="Train from scratch using HF model (default)")
+parser.add_argument("--resume", action="store_true", help="Resume from checkpoint (overrides --scratch)")
+parser.add_argument("--checkpoint-every", type=int, default=2000, help="Save checkpoint every N steps")
+parser.add_argument("--checkpoint-path", type=str, default=None, help="Specific checkpoint path to resume from")
 args = parser.parse_args()
 user_config = vars(args).copy()
 
@@ -126,7 +138,7 @@ def get_lr(it, max_iters, warmup_iters, learning_rate, min_lr=None):
 
 def main():
     print0("=" * 70)
-    print0("SFT 微调 (梯度累积版)")
+    print0("SFT 微调")
     print0("=" * 70)
     
     prepare_data_split()
@@ -158,6 +170,16 @@ def main():
     print0(f"  LoRA: {'启用' if args.use_lora else '禁用'}")
     if args.use_lora:
         print0(f"    r={args.lora_r}, alpha={args.lora_alpha}, targets={args.lora_targets}")
+    
+    # 初始化 wandb
+    if args.use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            entity=args.wandb_entity,
+            config=user_config,
+        )
+        print0(f"  Wandb: 已启用 (project={args.wandb_project})")
     
     # 加载 tokenizer
     print0(f"\n加载 tokenizer...")
@@ -195,41 +217,79 @@ def main():
             val_dataset, tokenizer, args.max_seq_len, args.device_batch_size, device, args.buffer_size
         )
     
-    # 加载模型
-    print0(f"\n加载模型...")
-    model = GPT.from_pretrained(args.model_name)
-    model = model.to(dtype=ptdtype, device=device)
-    
-    # 注入 LoRA
-    if args.use_lora:
-        lora_targets = set(args.lora_targets.split(","))
-        apply_lora(model, r=args.lora_r, alpha=args.lora_alpha, 
-                   dropout=args.lora_dropout, targets=lora_targets)
-        mark_only_lora_as_trainable(model)
-    
-    model.train()
-    
-    n_params = sum(p.numel() for p in model.parameters())
-    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print0(f"  总参数: {n_params/1e6:.1f}M")
-    print0(f"  可训练参数: {n_trainable/1e6:.1f}M ({100*n_trainable/n_params:.2f}%)")
-    
-    # 优化器
-    decay_params = [p for p in model.parameters() if p.requires_grad and p.dim() >= 2]
-    nodecay_params = [p for p in model.parameters() if p.requires_grad and p.dim() < 2]
-    optimizer = torch.optim.AdamW([
-        {"params": decay_params, "weight_decay": args.weight_decay},
-        {"params": nodecay_params, "weight_decay": 0.0},
-    ], lr=args.learning_rate, betas=(0.9, 0.95))
-    
-    # AMP
-    scaler = torch.amp.GradScaler(device_type, enabled=(args.dtype == "float16"))
-    
     # 训练状态
     os.makedirs(args.out_dir, exist_ok=True)
     best_val_loss = float('inf')
     patience_cnt = 0
     step = 0  # optimizer step 计数
+    
+    # 判断训练模式: scratch (默认) 或 resume
+    if args.resume or args.checkpoint_path:
+        # 断点续训模式: 从 checkpoint 恢复
+        print0(f"\n[断点续训模式] 从 checkpoint 恢复...")
+        
+        # 先创建模型结构 (不加载 HF 权重)
+        print0(f"\n初始化模型结构...")
+        model = GPT.from_pretrained(args.model_name, load_weights=False)
+        model = model.to(dtype=ptdtype, device=device)
+        
+        # 注入 LoRA
+        if args.use_lora:
+            lora_targets = set(args.lora_targets.split(","))
+            apply_lora(model, r=args.lora_r, alpha=args.lora_alpha, 
+                       dropout=args.lora_dropout, targets=lora_targets)
+            mark_only_lora_as_trainable(model)
+        
+        # 优化器
+        decay_params = [p for p in model.parameters() if p.requires_grad and p.dim() >= 2]
+        nodecay_params = [p for p in model.parameters() if p.requires_grad and p.dim() < 2]
+        optimizer = torch.optim.AdamW([
+            {"params": decay_params, "weight_decay": args.weight_decay},
+            {"params": nodecay_params, "weight_decay": 0.0},
+        ], lr=args.learning_rate, betas=(0.9, 0.95))
+        
+        # AMP
+        scaler = torch.amp.GradScaler(device_type, enabled=(args.dtype == "float16"))
+        
+        # 加载 checkpoint
+        if args.checkpoint_path:
+            step, best_val_loss = load_checkpoint(args.checkpoint_path, model, optimizer, device)
+        else:
+            step, best_val_loss = resume_from_checkpoint(args.out_dir, model, optimizer, device)
+        patience_cnt = 0
+        
+        model.train()
+        
+    else:
+        # 从头训练模式: 从 HF 加载模型
+        print0(f"\n[从头训练模式] 从 HuggingFace 加载模型...")
+        model = GPT.from_pretrained(args.model_name)
+        model = model.to(dtype=ptdtype, device=device)
+        
+        # 注入 LoRA
+        if args.use_lora:
+            lora_targets = set(args.lora_targets.split(","))
+            apply_lora(model, r=args.lora_r, alpha=args.lora_alpha, 
+                       dropout=args.lora_dropout, targets=lora_targets)
+            mark_only_lora_as_trainable(model)
+        
+        model.train()
+        
+        # 优化器
+        decay_params = [p for p in model.parameters() if p.requires_grad and p.dim() >= 2]
+        nodecay_params = [p for p in model.parameters() if p.requires_grad and p.dim() < 2]
+        optimizer = torch.optim.AdamW([
+            {"params": decay_params, "weight_decay": args.weight_decay},
+            {"params": nodecay_params, "weight_decay": 0.0},
+        ], lr=args.learning_rate, betas=(0.9, 0.95))
+        
+        # AMP
+        scaler = torch.amp.GradScaler(device_type, enabled=(args.dtype == "float16"))
+    
+    n_params = sum(p.numel() for p in model.parameters())
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print0(f"  总参数: {n_params/1e6:.1f}M")
+    print0(f"  可训练参数: {n_trainable/1e6:.1f}M ({100*n_trainable/n_params:.2f}%)")
     
     print0(f"\n开始训练 (max_iters={args.num_iterations}, grad_accum={args.grad_accum_steps})")
     print0("-" * 70)
@@ -257,6 +317,13 @@ def main():
             
             print0(f"\n[eval] step {step}: val_loss={val_loss:.4f}, lr={lr:.2e}")
             
+            # 记录验证指标到 wandb
+            if args.use_wandb:
+                wandb.log({
+                    "val/loss": val_loss,
+                    "val/step": step,
+                }, step=step)
+            
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 patience_cnt = 0
@@ -274,12 +341,18 @@ def main():
                             "user_config": user_config,
                         }, os.path.join(args.out_dir, "best_model.pt"))
                     tokenizer.save_pretrained(args.out_dir)
+                    
             else:
                 patience_cnt += 1
                 print0(f"  ✗ 未改善 ({patience_cnt}/{args.patience})")
                 if patience_cnt >= args.patience:
                     print0(f"\n早停触发! best_val_loss={best_val_loss:.4f}")
                     break
+            
+            # 定期保存 checkpoint
+            if not args.dry_run and step % args.checkpoint_every == 0:
+                print0(f"  保存 checkpoint...")
+                save_checkpoint(args.out_dir, step, model, optimizer, best_val_loss, user_config)
         
         # ====================================================================
         # 【梯度累积训练步骤】
@@ -315,6 +388,15 @@ def main():
             toks_per_sec = toks_per_step / dt
             print0(f"step {step:05d} | loss: {accum_loss:.4f} | lr: {lr:.2e} | "
                    f"dt: {dt*1000:.0f}ms | tok/s: {toks_per_sec:.0f}")
+            
+            # 记录训练指标到 wandb
+            if args.use_wandb:
+                wandb.log({
+                    "train/loss": accum_loss,
+                    "train/learning_rate": lr,
+                    "train/tokens_per_sec": toks_per_sec,
+                    "train/dt_ms": dt * 1000,
+                }, step=step)
         
         step += 1
     
@@ -331,6 +413,16 @@ def main():
                 "val_loss": val_loss if 'val_loss' in locals() else None,
                 "user_config": user_config,
             }, os.path.join(args.out_dir, "final_model.pt"))
+        
+        # 保存最终 checkpoint
+        print0(f"\n保存最终 checkpoint...")
+        save_checkpoint(args.out_dir, step, model, optimizer, best_val_loss, user_config)
+    
+    # 记录训练总结到 wandb
+    if args.use_wandb:
+        wandb.summary["best_val_loss"] = best_val_loss
+        wandb.summary["final_step"] = step
+        wandb.finish()
     
     print0(f"\n{'='*70}")
     print0(f"训练完成! best_val_loss={best_val_loss:.4f}")
