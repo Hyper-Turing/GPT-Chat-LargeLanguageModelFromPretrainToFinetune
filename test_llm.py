@@ -23,9 +23,9 @@ LORA_PATH = "out/sft/lora_best.pt"  # 或 lora_final.pt
 
 # 非 LoRA 时的 checkpoint 路径（USE_LORA=True 时此项无效）
 CKPT_PATH = None  # 例如 "out/sft/best_model.pt"
-LORA_R = 16
-LORA_ALPHA = 32
-LORA_TARGETS = {"c_q", "c_v"}
+LORA_R = 32
+LORA_ALPHA = 64
+LORA_TARGETS = {"c_q", "c_k", "c_v", "c_proj"}
 
 # 生成参数
 MAX_NEW_TOKENS = 512  #
