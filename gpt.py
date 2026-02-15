@@ -200,7 +200,7 @@ class CausalSelfAttention(nn.Module):
             .expand(B, n_kv, self.n_rep, T, D)
             .reshape(B, self.n_head, T, D))
     
-    def forward(self, x, cos, sin, kv_cache: Optional[KVCache] = None):
+    def forward(self, x, cos, sin, kv_cache: Optional[KVCache] = None, attn_mask: Optional[torch.Tensor] = None):
         B, T, C = x.size()
 
         # QKV 投影
@@ -213,28 +213,62 @@ class CausalSelfAttention(nn.Module):
         k = apply_rotary_emb(k, cos, sin)
 
         # 转置为 (B, n_head, T, head_dim) 用于 attention
-        q = q.transpose(1, 2) # (B, n_head, T, head_dim)
-        k = k.transpose(1, 2) # (B, n_kv_head, T, head_dim)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
         # KVCache
         if kv_cache is not None:
-            # 更新缓存并获取完整的 kv
-            k, v = kv_cache.update(self.layer_idx, k, v) # k, v 现在是 (B, n_kv_head, total_seq_len, head_dim)
+            k, v = kv_cache.update(self.layer_idx, k, v)
 
-        # GQA: 复制 KV heads  以匹配 Q heads
-        k = self._repeat_kv(k)  # (B, n_head, T, head_dim)
+        # GQA: 复制 KV heads 以匹配 Q heads
+        k = self._repeat_kv(k)
         v = self._repeat_kv(v)
-        
-        # Attention
-        # 当使用 KV cache 时, Q 可能只有 1 个 token, 而 KV 有很多
-        # is_causal=True 只在 Q 和 KV 长度相同时正确
-        # 当 decode (T_q=1) 时, 不需要 causal mask (单 token 天然 causal)
-        is_causal = (q.size(2) == k.size(2))
-        y = F.scaled_dot_product_attention(q, k, v, 
-                                           is_causal=is_causal, 
-                                           dropout_p=self.attn_dropout.p if self.training else 0.0)
-        
+
+        # ================================================================
+        # 关键修复：正确处理 causal mask 和 padding mask 的组合
+        # PyTorch 的 scaled_dot_product_attention 不允许同时使用
+        # is_causal=True 和 attn_mask，需要手动组合
+        # ================================================================
+        T_q = q.size(2)
+        T_k = k.size(2)
+
+        if attn_mask is not None:
+            # 有 padding mask 时：手动构建 causal + padding 的组合 mask
+            # 1. 构建 causal mask (下三角)
+            attn_bias = torch.zeros((T_q, T_k), dtype=q.dtype, device=q.device)
+            if T_q == T_k:
+                # 训练模式：需要因果 mask
+                causal_mask = torch.triu(
+                    torch.full((T_q, T_k), float('-inf'), dtype=q.dtype, device=q.device),
+                    diagonal=1
+                )
+                attn_bias = attn_bias + causal_mask
+
+            # 2. 叠加 padding mask
+            # attn_mask: (B, T_k) - True 表示 padding 位置
+            # 扩展为 (B, 1, 1, T_k) 并叠加
+            pad_bias = torch.zeros((B, 1, 1, T_k), dtype=q.dtype, device=q.device)
+            pad_bias = pad_bias.masked_fill(attn_mask.unsqueeze(1).unsqueeze(2), float('-inf'))
+            attn_bias = attn_bias.unsqueeze(0).unsqueeze(0) + pad_bias  # (B, 1, T_q, T_k)
+
+            # 使用组合 mask，is_causal=False
+            y = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_bias,
+                is_causal=False,
+                dropout_p=self.attn_dropout.p if self.training else 0.0
+            )
+        else:
+            # 无 padding mask 时：直接用 is_causal
+            is_causal = (T_q == T_k)
+            y = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                is_causal=is_causal,
+                dropout_p=self.attn_dropout.p if self.training else 0.0
+            )
+
         # 输出投影
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_dropout(self.c_proj(y))
@@ -259,9 +293,9 @@ class Block(nn.Module):
         self.ln_2 = RMSNorm(config.n_embd, config.rms_norm_eps)
         self.mlp = MLP(config)
 
-    def forward(self, x, cos, sin, kv_cache: Optional[KVCache] = None):
+    def forward(self, x, cos, sin, kv_cache: Optional[KVCache] = None, attn_mask: Optional[torch.Tensor] = None):
         # Pre-LN + 残差
-        x = x + self.attn(self.ln_1(x), cos, sin, kv_cache=kv_cache)
+        x = x + self.attn(self.ln_1(x), cos, sin, kv_cache=kv_cache, attn_mask=attn_mask)
         x = x + self.mlp(self.ln_2(x))
         return x
     
@@ -293,10 +327,16 @@ class GPT(nn.Module):
         sin = freqs.sin()[None, :, None, :]
         return cos, sin
     
-    def forward(self, idx, targets=None, kv_cache: Optional[KVCache] = None):
+    def forward(self, idx, targets=None, kv_cache: Optional[KVCache] = None, attn_mask: Optional[torch.Tensor] = None):
         """
         wte → LN → [Block x n_layer] → ln_f → lm_head
         支持KV Cache
+        
+        Args:
+            idx: (B, T) token ids
+            targets: (B, T) target token ids (训练时使用)
+            kv_cache: KVCache 对象 (推理时使用)
+            attn_mask: (B, T) bool tensor, True 表示需要 mask 的位置（padding）
         """
         B, T = idx.size()
 
@@ -315,7 +355,7 @@ class GPT(nn.Module):
 
         # Transformer blocks
         for block in self.transformer.h:
-            x = block(x, cos, sin, kv_cache=kv_cache)
+            x = block(x, cos, sin, kv_cache=kv_cache, attn_mask=attn_mask)
 
         # 所有层完成后统一推进缓存位置
         if kv_cache is not None:
@@ -327,8 +367,8 @@ class GPT(nn.Module):
 
         if targets is not None:
             loss = F.cross_entropy(
-                logits.float().view(-1, logits.size(-1)),
-                targets.view(-1),
+                logits.reshape(-1, logits.size(-1)),
+                targets.reshape(-1),
                 ignore_index=-100,
             )
             return logits, loss

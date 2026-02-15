@@ -50,30 +50,59 @@ class LoRALinear(nn.Module):
         self.out_features = original_linear.out_features
         self.r = r
         self.scaling = alpha / r  # LoRA 缩放因子
-        
+
         # 保留原始权重（冻结）
         self.weight = original_linear.weight  # 不复制，直接引用
         self.bias = original_linear.bias
-        
-        # ✅ 获取原始权重的数据类型和设备
-        dtype = original_linear.weight.dtype
+
+        # ✅ 获取原始权重的设备
         device = original_linear.weight.device
-        
-        # LoRA 旁路（可训练）- 使用与原始权重相同的数据类型和设备
-        self.lora_A = nn.Parameter(torch.empty(r, self.in_features, dtype=dtype, device=device))
-        self.lora_B = nn.Parameter(torch.zeros(self.out_features, r, dtype=dtype, device=device))  # B 零初始化
-        
+
+        # ✅ 关键修复：LoRA 参数始终使用 float32，避免 bfloat16 精度损失
+        # 基座模型可以是 bfloat16（节省显存），但 LoRA 参数用 float32（保证精度）
+        self.lora_A = nn.Parameter(torch.empty(r, self.in_features, dtype=torch.float32, device=device))
+        self.lora_B = nn.Parameter(torch.zeros(self.out_features, r, dtype=torch.float32, device=device))  # B 零初始化
+
         # A 用 Kaiming 初始化
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-        
+
         # 可选 dropout
         self.lora_dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-    
+
+    def _apply(self, fn):
+        """重写 _apply 方法，防止 LoRA 参数被转换为 float16/bfloat16"""
+        # 先保存 LoRA 参数的原始 dtype
+        lora_A_dtype = self.lora_A.dtype
+        lora_B_dtype = self.lora_B.dtype
+
+        # 调用父类的 _apply（会转换所有参数）
+        super()._apply(fn)
+
+        # 强制将 LoRA 参数转回 float32
+        if self.lora_A.dtype != lora_A_dtype:
+            self.lora_A.data = self.lora_A.data.to(lora_A_dtype)
+        if self.lora_B.dtype != lora_B_dtype:
+            self.lora_B.data = self.lora_B.data.to(lora_B_dtype)
+
+        return self
+
     def forward(self, x):
         # 原始路径（冻结权重）
         base_out = F.linear(x, self.weight, self.bias)
+
         # LoRA 旁路: x @ A^T @ B^T * scaling
-        lora_out = F.linear(F.linear(self.lora_dropout(x), self.lora_A), self.lora_B)
+        # ✅ 关键修复：将输入转为 float32 进行 LoRA 计算，保证精度
+        x_lora = self.lora_dropout(x)
+
+        # 如果输入不是 float32，转换为 float32 进行高精度计算
+        if x_lora.dtype != torch.float32:
+            x_lora = x_lora.to(torch.float32)
+            lora_out = F.linear(F.linear(x_lora, self.lora_A), self.lora_B)
+            # 转回原始 dtype
+            lora_out = lora_out.to(base_out.dtype)
+        else:
+            lora_out = F.linear(F.linear(x_lora, self.lora_A), self.lora_B)
+
         return base_out + lora_out * self.scaling
     
     def merge_weights(self):
