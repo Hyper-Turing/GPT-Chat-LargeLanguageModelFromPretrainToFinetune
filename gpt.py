@@ -1,5 +1,5 @@
 """
-基于nanochat/gpt 改动适配Qwen2.5
+基于NanoChat/gpt 改动适应Qwen2.5参数映射
 """
 import math
 from dataclasses import dataclass
@@ -9,49 +9,36 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ======================================================================
-# Config
-# ======================================================================
-
 @dataclass
 class GPTConfig:
     max_seq_len: int = 2048
-    vocab_size: int = 152064
-    n_layer: int = 28               # Qwen2.5-7B
-    n_head: int = 28                # Q heads
-    n_kv_head: int = 4              # KV heads (GQA)
+    vocab_size: int  = 152064
+    n_layer: int = 28
+    n_head: int = 28
+    n_kv_head:int = 4
     n_embd: int = 3584
-    intermediate_size: int = 18944
-    rope_base: float = 1000000.0 
+    intermediate_size: int = 18944 # ffn的中间维度
+    rope_base: float = 1000000.0
     rms_norm_eps: float = 1e-6
     dropout: float = 0.0
-
+    
     @classmethod
     # 工厂模式
-    def qwen2_5_0_7b(cls):
+    # 通过config = GPTConfig.qwen_2_5_0_7b()调用 即可正确配置
+    def qwen_2_5_0_7b(cls):
         return cls(n_layer=28, n_head=28, n_kv_head=4, n_embd=3584,
                    intermediate_size=18944, vocab_size=152064)
-
-"""
-为什么kv_head=4? 
-Attention中kv所占显存=2 * batch_size * kv_head * seq_len * head_dim * n_layers * 2(float16)
-MHA 中 kv_head = n_head = 28
-GQA 中 kv_head = 4
-两者差距 7 倍，显存占用大幅降低
-"""
-
+    
+    # 本项目目前中采用从Hugging Face加载官方参数
+    # 保留接口以后可以添加自定义权重
 
 # ======================================================================
-# KVCache 
+# Utils
 # ======================================================================
-
 class KVCache:
     """
-    KV 缓存类，适配 PyTorch 原生 scaled_dot_product_attention。
-    核心设计:
-    - 预分配缓存张量，避免动态分配开销
-    - 通过 seq_len 追踪当前已填充的位置
-    - 支持 prefill (预填充) 和逐 token decode 两种模式
+    KVCache
+    预分配缓存张量，避免动态分配开销
     """
     def __init__(self, batch_size, num_kv_heads, max_seq_len, head_dim, num_layers, device, dtype):
         """
@@ -69,11 +56,8 @@ class KVCache:
         self.n_layers = num_layers
         self.max_seq_len = max_seq_len
         self.head_dim = head_dim
-
         # 预分配 (n_layers, B, H, T, D)
-        # Transformer中每一层都有独立的kv
         # 统一使用同一个KVCache对象管理所有层的缓存，而不是每层单独创建对象
-        # 注意 H 和 T 的顺序
         self.k_cache = torch.zeros(
             num_layers, batch_size, num_kv_heads, max_seq_len, head_dim,
             device=device, dtype=dtype
@@ -81,15 +65,13 @@ class KVCache:
         self.v_cache = torch.zeros(
             num_layers, batch_size, num_kv_heads, max_seq_len, head_dim,
             device=device, dtype=dtype
-        )
+        ) # 注意 H 和 T 的顺序
         self.seq_len = 0 # 尾指针
 
     def reset(self):
-        """重置缓存"""
         self.seq_len = 0
 
     def get_seq_len(self):
-        """获取当前缓存中的 token 数"""
         return self.seq_len
     
     def update(self, layer_idx, k_new, v_new):
@@ -105,34 +87,34 @@ class KVCache:
             k_full: (B, n_kv_head, seq_len + T_new, head_dim)
             v_full: (B, n_kv_head, seq_len + T_new, head_dim)
         """
-        T_new = k_new.size(2) # 新token的数量，prefill时>1
+        T_new = k_new.size(2) # 新的tokens数量
         start = self.seq_len
         end = start + T_new
 
         assert end <= self.max_seq_len, f"KV Cache overflow: {end} > {self.max_seq_len}"
 
-        # 写入新的KV到huanc
+        # 写入新的KV到缓存中
         self.k_cache[layer_idx, :, :, start:end, :] = k_new
         self.v_cache[layer_idx, :, :, start:end, :] = v_new
 
-        # 返回完整的 KV (从 0 到 end)
+        # 返回完整的KV 从0到end
+        # TODO 动态切片，未来优化为返回整个预分配buffer 避免重复切片
         k_full = self.k_cache[layer_idx, :, :, :end, :]
         v_full = self.v_cache[layer_idx, :, :, :end, :]
         return k_full, v_full
     
-
     def advance(self, num_tokens):
-        """推进缓存位置"""
+        # 更新尾指针
         self.seq_len += num_tokens
 
     def prefill(self, other):
         """
-        用于批量生成场景:为同一个问题生成多个答案时
-        先 batch=1 预填充, 再复制到 batch=N 的缓存中
+        批量问题优化：为同一个问题生成多个答案时
+        只需要做一次昂贵的prefill计算，后续只需要分别计算回答部分的token即可
         """
-        assert self.seq_len == 0, "Cannot prefill a non-empty KV cache"
+        assert self.seq_len == 0, "Cannot prefill a non-empty KVCache"
         pos = other.seq_len
-        # 广播: other 可能是 batch=1, self 可能是 batch=N
+        # 广播机制：other 可能是 batch=1, self 可能是 batch=N
         self.k_cache[:, :, :, :pos, :] = other.k_cache[:, :, :, :pos, :]
         self.v_cache[:, :, :, :pos, :] = other.v_cache[:, :, :, :pos, :]
         self.seq_len = pos
@@ -140,26 +122,25 @@ class KVCache:
 # ======================================================================
 # Modules
 # ======================================================================
-
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
-    
+
     def forward(self, x):
-        # 在 float32 下计算归一化，避免 bf16 精度问题
+        # 混合精度：在 float32 下计算归一化，避免 bf16 精度问题
         input_dtype = x.dtype
         x = x.float()
         x = F.rms_norm(x, (x.size(-1),), self.weight.float(), self.eps)
         return x.to(input_dtype)
-    
+
 
 def apply_rotary_emb(x, cos, sin):
-    assert x.ndim == 4
-    d = x.shape[3] // 2
+    assert x.ndim == 4 # x: (B, H, T, D)
+    d = x.shape[3] // 2 # head_dim维度一分为二，每对[x1, x2]组成旋转向量
+    # 只要把d维两两不重复分为d/2组即可，怎么选取不重要
     x1, x2 = x[..., :d], x[..., d:]
-    # 在 float32 下计算旋转，避免 bf16 精度损失
     cos = cos.float()
     sin = sin.float()
     y1 = x1.float() * cos - x2.float() * sin
@@ -174,7 +155,7 @@ class CausalSelfAttention(nn.Module):
         self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
-        self.n_rep = self.n_head // self.n_kv_head
+        self.n_rep = self.n_head // self.n_kv_head # 每个kv组的大小 即每个kv头被多少个query头共享
 
         assert self.n_embd % self.n_head == 0
         assert self.n_head % self.n_kv_head == 0
@@ -187,23 +168,33 @@ class CausalSelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
 
+        # 预计算causal mask, 下三角为True-可见
+        self.register_buffer(
+            "bias",
+            torch.tril(torch.ones(config.max_seq_len, config.max_seq_len, dtype=torch.bool))
+                 .view(1, 1, config.max_seq_len, config.max_seq_len),
+            persistent=False, # 不保存到checkpoint
+        )
+
     def _repeat_kv(self, x):
         """
-        将 KV heads 复制以匹配 Q heads 数量 (GQA)
-        x: (B, n_kv_head, T, head_dim)
-        return: (B, n_head, T, head_dim)
+        将kv heads复制n_rep次以匹配q heads的数量
+        Args:
+            x: (B, n_kv_head, T, head_dim)
+        Return:
+            (B, n_head, T, head_dim)
         """
-        if self.n_rep == 1:
+        if self.n_rep == 1: # MHA
             return x
         B, n_kv, T, D = x.shape
         return (x[:, :, None, :, :]
-            .expand(B, n_kv, self.n_rep, T, D)
-            .reshape(B, self.n_head, T, D))
+                .expand(B, n_kv, self.n_rep, T, D) # 在dim=2上复制n_rep 实际是零拷贝
+                .reshape(B, self.n_head, T, D))
     
     def forward(self, x, cos, sin, kv_cache: Optional[KVCache] = None, attn_mask: Optional[torch.Tensor] = None):
         B, T, C = x.size()
 
-        # QKV 投影
+        # QKV投影
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
@@ -212,12 +203,11 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
 
-        # 转置为 (B, n_head, T, head_dim) 用于 attention
+        # 转置为 (B, H, T, D) 用于 attention
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        # KVCache
         if kv_cache is not None:
             k, v = kv_cache.update(self.layer_idx, k, v)
 
@@ -225,55 +215,40 @@ class CausalSelfAttention(nn.Module):
         k = self._repeat_kv(k)
         v = self._repeat_kv(v)
 
-        # ================================================================
-        # 关键修复：正确处理 causal mask 和 padding mask 的组合
-        # PyTorch 的 scaled_dot_product_attention 不允许同时使用
-        # is_causal=True 和 attn_mask，需要手动组合
-        # ================================================================
         T_q = q.size(2)
         T_k = k.size(2)
 
-        if attn_mask is not None:
-            # 有 padding mask 时：手动构建 causal + padding 的组合 mask
-            # 1. 构建 causal mask (下三角)
-            attn_bias = torch.zeros((T_q, T_k), dtype=q.dtype, device=q.device)
-            if T_q == T_k:
-                # 训练模式：需要因果 mask
-                causal_mask = torch.triu(
-                    torch.full((T_q, T_k), float('-inf'), dtype=q.dtype, device=q.device),
-                    diagonal=1
-                )
-                attn_bias = attn_bias + causal_mask
+        # 切片causal mask
+        # bias: (1, 1, max_seq_len, max_seq_len)
+        # T_k - T_q 训练时=0
+        # 取[0:5, :5] 0~4行 完整下三角
+        # 推理阶段 T_q = 1 只处理最新的token
+        # T_k = Cache中历史的token数
+        # T_k - T_q = 10 - 1 = 9, [9:10, :10] 只取最后一行[1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+        # Q10 可以看见所有历史K0~K10
+        causal_mask = self.bias[:, :, T_k - T_q:T_k, :T_k]
+        attn_bias = torch.zeros((1, 1, T_q, T_k), dtype=q.dtype, device=q.device)
+        attn_bias = attn_bias.masked_fill(~causal_mask, float('-inf'))
 
-            # 2. 叠加 padding mask
-            # attn_mask: (B, T_k) - True 表示 padding 位置
-            # 扩展为 (B, 1, 1, T_k) 并叠加
-            pad_bias = torch.zeros((B, 1, 1, T_k), dtype=q.dtype, device=q.device)
-            pad_bias = pad_bias.masked_fill(attn_mask.unsqueeze(1).unsqueeze(2), float('-inf'))
-            attn_bias = attn_bias.unsqueeze(0).unsqueeze(0) + pad_bias  # (B, 1, T_q, T_k)
+        # 如果有padding mask 叠加
+        # 推理阶段不需要 因为 KV Cache 只存有效token
+        if attn_mask is not None: 
+            # attn_mask: (B, T_k) True表示padding的位置
+            pad_mask = attn_mask.unsqueeze(1).unsqueeze(2) # (B, 1, 1, T_k)
+            attn_bias = attn_bias.expand(B, -1, -1, -1)
+            attn_bias = attn_bias.masked_fill(pad_mask, float('-inf'))
 
-            # 使用组合 mask，is_causal=False
-            y = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attn_bias,
-                is_causal=False,
-                dropout_p=self.attn_dropout.p if self.training else 0.0
-            )
-        else:
-            # 无 padding mask 时：直接用 is_causal
-            is_causal = (T_q == T_k)
-            y = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=None,
-                is_causal=is_causal,
-                dropout_p=self.attn_dropout.p if self.training else 0.0
-            )
+        y = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_bias,
+            is_causal=False,
+            dropout_p=self.attn_dropout.p if self.training else 0.0
+        )
 
         # 输出投影
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_dropout(self.c_proj(y))
         return y
-    
 
 class MLP(nn.Module):
     def __init__(self, config):
@@ -292,14 +267,13 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.ln_2 = RMSNorm(config.n_embd, config.rms_norm_eps)
         self.mlp = MLP(config)
-
-    def forward(self, x, cos, sin, kv_cache: Optional[KVCache] = None, attn_mask: Optional[torch.Tensor] = None):
-        # Pre-LN + 残差
-        x = x + self.attn(self.ln_1(x), cos, sin, kv_cache=kv_cache, attn_mask=attn_mask)
+    
+    def forward(self, x, cos, sin,  kv_cache: Optional[KVCache] = None, attn_mask: Optional[torch.Tensor] = None):
+        # Pre-LN + residual
+        x = x + self.attn(self.ln_1(x), cos, sin, kv_cache, attn_mask)
         x = x + self.mlp(self.ln_2(x))
         return x
     
-
 class GPT(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
@@ -322,7 +296,20 @@ class GPT(nn.Module):
     def _precompute_rotary(self, seq_len, head_dim, base=1000000.0):
         inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
         t = torch.arange(seq_len, dtype=torch.float32)
-        freqs = torch.outer(t, inv_freq)
+        # .outer 并矢积
+        # t: seq_len的一维张量，inv_freq：head_dim/2的一维张量
+        # freqs: (seq_len, head_dim / 2)
+        # 假设 head_dim=8 (简化), base=10000
+        # inv_freq = [1.0, 0.5, 0.25, 0.125]
+        # t = [0, 1, 2, 3, 4]
+        # freqs = torch.outer(t, inv_freq)
+        #         频率 0   频率 1   频率 2   频率 3
+        # 位置 0  [0×1.0, 0×0.5, 0×0.25, 0×0.125]
+        # 位置 1  [1×1.0, 1×0.5, 1×0.25, 1×0.125]
+        # 位置 2  [2×1.0, 2×0.5, 2×0.25, 2×0.125]
+        # 位置 3  [3×1.0, 3×0.5, 3×0.25, 3×0.125]
+        # 位置 4  [4×1.0, 4×0.5, 4×0.25, 4×0.125]
+        freqs = torch.outer(t, inv_freq) 
         cos = freqs.cos()[None, :, None, :]   # (1, seq_len, 1, head_dim/2)
         sin = freqs.sin()[None, :, None, :]
         return cos, sin
@@ -340,28 +327,27 @@ class GPT(nn.Module):
         """
         B, T = idx.size()
 
-        # Token embedding
+        # token embedding
         x = self.transformer.wte(idx)
 
         # RoPE slice
-        # 需要根据 KV Cahce 中的位置来取得正确的 cos/sin
         if kv_cache is not None:
             pos_start = kv_cache.get_seq_len()
-            cos = self.cos[:, pos_start:pos_start + T]
+            cos = self.cos[:, pos_start:pos_start + T] # T=1
             sin = self.sin[:, pos_start:pos_start + T]
         else:
             cos = self.cos[:, :T]
             sin = self.sin[:, :T]
 
-        # Transformer blocks
+        # transformer blocks
         for block in self.transformer.h:
-            x = block(x, cos, sin, kv_cache=kv_cache, attn_mask=attn_mask)
+            x = block(x, cos, sin, kv_cache, attn_mask)
 
         # 所有层完成后统一推进缓存位置
         if kv_cache is not None:
             kv_cache.advance(T)
 
-        # Final norm + LM head
+        # final norm + LM head
         x = self.ln_f(x)
         logits = self.lm_head(x)
 
@@ -373,9 +359,9 @@ class GPT(nn.Module):
             )
             return logits, loss
         else:
-            # 推理：只取最后一个位置
+            # 推理，只取最后一个位置
             return logits[:, [-1], :], None
-        
+    
     def _create_kv_cache(self, batch_size, seq_len, device, dtype):
         return KVCache(
             batch_size=batch_size,
@@ -386,22 +372,11 @@ class GPT(nn.Module):
             device=device,
             dtype=dtype,
         )
-
-
+    
     @torch.no_grad()
-    def generate(
-        self, 
-        idx, 
-        max_new_tokens, 
-        temperature=1.0, 
-        top_k=None, 
-        top_p=None,
-        repetition_penalty=1.1,
-        do_sample=True,
-        eos_token_id=None,
-        pad_token_id=None,
-        use_kv_cache=True,
-    ):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, 
+                top_p=None, repetition_penalty=1.0, do_sample=True, 
+                eos_token_id=None, pad_token_id=None,):
         """
         生成文本序列
         
@@ -412,140 +387,113 @@ class GPT(nn.Module):
             top_k: top-k 采样
             top_p: nucleus 采样
             do_sample: 是否采样（False 则贪心解码）
-            eos_token_id: 停止 token（可以是 int 或 list）
+            eos_token_id: 停止 token
             pad_token_id: padding token id
-            use_kv_cache:   是否使用 KV Cache
         """
         B = idx.size(0)
         device = idx.device
         dtype = next(self.parameters()).dtype
-        
-        # 支持多个 EOS token
+
         if eos_token_id is not None:
-            if isinstance(eos_token_id, int):
-                eos_token_id = [eos_token_id]
             eos_token_id = torch.tensor(eos_token_id, device=device)
-        
+
         # 跟踪哪些序列已经结束
         finished = torch.zeros(B, dtype=torch.bool, device=device)
 
-        if use_kv_cache:
-            total_len = idx.size(1) + max_new_tokens
-            kv_cache = self._create_kv_cache(B, total_len, device, dtype)
+        total_len = idx.size(1) + max_new_tokens
+        kv_cache = self._create_kv_cache(B, total_len, device, dtype)
 
-            # Prefill
-            logits, _  = self.forward(idx, kv_cache=kv_cache)
-            # logits shape: (B, T, vocab_size)
+        # prefill
+        logits, _ = self.forward(idx, kv_cache=kv_cache) # logits: (B, T, vocab_size)
 
-            # 收集生成的 token
-            generated = idx
+        generated = idx
 
-            for _ in range(max_new_tokens):
-                # 如果所有序列都结束了，提前退出
-                if finished.all():
-                    break
+        for _ in range(max_new_tokens):
+            # 如果所有序列都结束了，提前退出
+            if finished.all():
+                break
 
-                next_logits = logits[:, -1, :]
+            next_logits = logits[:, -1, :]
+            
+            # 对已经结束的序列填 pad
+            if finished.any() and pad_token_id is not None:
+                next_logits[finished] = -float('Inf')
+                next_logits[finished, pad_token_id] = 0 # 强制生成pad
 
-                # 对已结束序列填 pad
-                if finished.any() and pad_token_id is not None:
-                    next_logits[finished] = -float('Inf')
-                    next_logits[finished, pad_token_id] = 0
+            # 采样
+            idx_next = self._sample(
+                next_logits, 
+                temperature, 
+                top_k, 
+                top_p, 
+                do_sample,
+                generated=generated, 
+                repetition_penalty=repetition_penalty,
+                ignore_ids=eos_token_id
+            )
 
-                # 采样（传入已生成的 token 用于重复惩罚）
-                idx_next = self._sample(next_logits, temperature, top_k, top_p, do_sample, generated=generated)
+            generated = torch.cat((generated, idx_next), dim=1)
 
-                generated = torch.cat((generated, idx_next), dim=1)
+            if eos_token_id is not None:
+                is_eos = idx_next.squeeze(1) == eos_token_id
+                finished = finished | is_eos
 
-                # 检查 EOS
-                if eos_token_id is not None:
-                    is_eos = (idx_next.squeeze(1).unsqueeze(1) == eos_token_id.unsqueeze(0)).any(dim=1)
-                    finished = finished | is_eos
+            # 如果所有序列都结束了，不再执行 forward
+            if finished.all():
+                break
 
-                # 如果所有序列都结束了，不再执行 forward
-                if finished.all():
-                    break
+            # 只送入新 token（为下一次迭代准备 logits）
+            logits, _ = self.forward(idx_next, kv_cache=kv_cache)
 
-                # Decode step: 只送入新 token（为下一次迭代准备 logits）
-                logits, _ = self.forward(idx_next, kv_cache=kv_cache)
+        return generated
 
-            return generated
-
-        else:
-            # 原始实现, 兼容旧代码
-            for _ in range(max_new_tokens):
-                if finished.all():
-                    break
-                    
-                idx_cond = idx if idx.size(1) <= self.config.max_seq_len else idx[:, -self.config.max_seq_len:]
-                logits, _ = self(idx_cond)
-                logits = logits[:, -1, :]
-                
-                if finished.any() and pad_token_id is not None:
-                    logits[finished] = -float('Inf')
-                    logits[finished, pad_token_id] = 0
-                
-                idx_next = self._sample(logits, temperature, top_k, top_p, do_sample, generated=idx, repetition_penalty=repetition_penalty)
-                idx = torch.cat((idx, idx_next), dim=1)
-                
-                if eos_token_id is not None:
-                    is_eos = (idx_next.squeeze(1).unsqueeze(1) == eos_token_id.unsqueeze(0)).any(dim=1)
-                    finished = finished | is_eos
-
-            return idx
-        
-
-    def _sample(self, logits, temperature, top_k, top_p, do_sample, generated=None, repetition_penalty=1.1):
-        """采样辅助函数, 从 logits 中采样下一个 token
-        
-        Args:
-            logits: (B, vocab_size) 的 logits
-            temperature: 温度参数
-            top_k: top-k 采样
-            top_p: nucleus 采样
-            do_sample: 是否采样
-            generated: (B, seq_len) 已生成的 token ids，用于重复惩罚
-            repetition_penalty: 重复惩罚系数，默认 1.5（>1 时降低已生成 token 的概率）
-        """
-        # 应用重复惩罚（参考 HuggingFace RepetitionPenaltyLogitsProcessor）
+    def _sample(self, logits, temperature=1.0, top_k=None, top_p=None,
+                do_sample=True, generated=None, repetition_penalty=1.0, ignore_ids=None):
+        # 重复惩罚
         if generated is not None and repetition_penalty > 1.0:
             for i in range(logits.size(0)):
-                unique_tokens = torch.unique(generated[i])
-                # 过滤掉特殊 token，不惩罚 stop tokens
-                mask = torch.ones(len(unique_tokens), dtype=torch.bool, device=unique_tokens.device)
-                for sid in [151643, 151645, 151644]:  # endoftext, im_end, im_start
-                    mask &= (unique_tokens != sid)
-                penalize_tokens = unique_tokens[mask]
-                # 正 logits 除以 penalty，负 logits 乘以 penalty
-                scores = logits[i, penalize_tokens]
-                logits[i, penalize_tokens] = torch.where(
-                    scores > 0, scores / repetition_penalty, scores * repetition_penalty
-                )
+                tokens = generated[i]
+                if ignore_ids is not None:
+                    mask = ~torch.isin(tokens, ignore_ids)
+                    tokens = tokens[mask]
+
+                if tokens.numel() > 0:
+                    unique_tokens = torch.unique(tokens)
+                    scores = logits[i, unique_tokens]
+                    scores = torch.where(
+                        scores > 0,
+                        scores / repetition_penalty,
+                        scores * repetition_penalty
+                    )
+                    logits[i, unique_tokens] = scores
         
-        if do_sample and temperature > 0:
+        # 贪心解码
+        if not do_sample:
+            return torch.argmax(logits, dim=-1, keepdim=True)
+        
+        if temperature > 0:
             logits = logits / temperature
 
-        if do_sample and top_k is not None and top_k > 0:
+        if top_k is not None and top_k > 0:
             v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-            logits[logits < v[:, [-1]]] = -float("Inf")
+            logits[logits < v[:, [-1]]] = -float('inf')
 
-        if do_sample and top_p is not None and top_p < 1.0:
+        if top_p is not None and top_p < 1.0:
             sorted_logits, sorted_indices = torch.sort(logits, descending=True)
             cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            
             sorted_indices_to_remove = cumulative_probs > top_p
             sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
-            sorted_indices_to_remove[:, 0] = 0
-            indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-            logits[indices_to_remove] = -float('Inf')
+            sorted_indices_to_remove[:, 0] = False
+            
+            indices_to_remove = sorted_indices_to_remove.scatter(
+                1, sorted_indices, sorted_indices_to_remove
+            )
+            logits[indices_to_remove] = -float('inf')
 
-        if do_sample:
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-        else:
-            idx_next = torch.argmax(logits, dim=-1, keepdim=True)
+        probs = F.softmax(logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1)
 
-        return idx_next
-    
     @classmethod
     def from_pretrained(cls, model_name="Qwen/Qwen2.5-7B", load_weights=True):
         """
@@ -572,14 +520,14 @@ class GPT(nn.Module):
 
         hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
 
-        # rope_base: 兼容不同版本的 HF config 属性名
+        # rope_base 兼容不同版本的HF config属性名
         rope_base = getattr(hf_config, 'rope_theta', None) \
-                    or getattr(hf_config, 'rope_base', None) \
+                    or getattr(hf_config, 'rope_base', None)\
                     or 1000000.0
-
-        # 从 HF config 构建我们的 config
+        
+        # 从HF config构建config
         config = GPTConfig(
-            max_seq_len=min(hf_config.max_position_embeddings, 2048),  # 限制长度省显存
+            max_seq_len=min(hf_config.max_position_embeddings, 2048),
             vocab_size=hf_config.vocab_size,
             n_layer=hf_config.num_hidden_layers,
             n_head=hf_config.num_attention_heads,
@@ -590,14 +538,14 @@ class GPT(nn.Module):
             rms_norm_eps=hf_config.rms_norm_eps,
         )
 
-        # 创建我们的模型（随机初始化）
+        # 创建自定义GPT 随机初始化
         model = cls(config)
 
         if not load_weights:
-            # 仅创建模型结构，不加载 HF 权重（用于断点续训）
+            # 仅创建模型 不加载权重
             return model
-
-        # 加载 HF 权重
+    
+        # 加载HF权重
         hf_model = AutoModelForCausalLM.from_pretrained(
             model_name, torch_dtype=torch.float32, trust_remote_code=True,
         )
@@ -627,7 +575,7 @@ class GPT(nn.Module):
                 f"{hf_pre}.post_attention_layernorm.weight":  f"{my_pre}.ln_2.weight",
             }
             mapping.update(layer_map)
-
+        
         sd = model.state_dict()
         for hf_key, my_key in mapping.items():
             if hf_key in hf_sd:
@@ -642,6 +590,9 @@ class GPT(nn.Module):
                 print(f"  Warning: HF key not found: {hf_key}")
 
         model.load_state_dict(sd)
-        del hf_model, hf_sd  # 释放 HF 模型内存
-        print("Weights loaded successfully!")
+        del hf_model, hf_sd
+        print("Weight loaded Successfully!\n")
         return model
+            
+            
+
