@@ -1,0 +1,767 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>SFT Chat</title>
+    <style>
+        :root {
+            color-scheme: light;
+            --bg: #ffffff;
+            --fg: #111827;
+            --fg-secondary: #6b7280;
+            --border: #e5e7eb;
+            --border-hover: #d1d5db;
+            --user-bubble: #f3f4f6;
+            --user-bubble-hover: #e5e7eb;
+            --assistant-hover: #f9fafb;
+            --accent: #2563eb;
+            --accent-light: rgba(37, 99, 235, 0.1);
+            --error-bg: #fee2e2;
+            --error-border: #fecaca;
+            --error-fg: #b91c1c;
+            --console-bg: #f8fafc;
+            --console-fg: #374151;
+            --btn-bg: #111827;
+            --btn-bg-hover: #2563eb;
+            --btn-disabled-bg: #e5e7eb;
+            --btn-disabled-fg: #9ca3af;
+            --btn-disabled-border: #d1d5db;
+            --settings-bg: #f9fafb;
+        }
+
+        * { box-sizing: border-box; }
+        html, body { height: 100%; margin: 0; }
+
+        body {
+            font-family: ui-sans-serif, -apple-system, system-ui, "Segoe UI", Helvetica, "Apple Color Emoji", Arial, sans-serif;
+            background-color: var(--bg);
+            color: var(--fg);
+            min-height: 100dvh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* ========== Header ========== */
+        .header {
+            background-color: var(--bg);
+            padding: 1rem 1.5rem;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .header-left {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .header h1 {
+            font-size: 1.15rem;
+            font-weight: 600;
+            margin: 0;
+            color: var(--fg);
+        }
+
+        .header-badge {
+            font-size: 0.7rem;
+            font-weight: 500;
+            background: linear-gradient(135deg, #6366f1, #8b5cf6);
+            color: white;
+            padding: 0.15rem 0.5rem;
+            border-radius: 9999px;
+            letter-spacing: 0.02em;
+        }
+
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .icon-btn {
+            width: 34px;
+            height: 34px;
+            padding: 0;
+            border: 1px solid var(--border);
+            border-radius: 0.5rem;
+            background-color: var(--bg);
+            color: var(--fg-secondary);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.15s ease;
+        }
+
+        .icon-btn:hover {
+            background-color: var(--user-bubble);
+            border-color: var(--border-hover);
+            color: var(--fg);
+        }
+
+        /* ========== Settings Panel ========== */
+        .settings-panel {
+            display: none;
+            background-color: var(--settings-bg);
+            border-bottom: 1px solid var(--border);
+            padding: 0.75rem 1.5rem;
+        }
+
+        .settings-panel.open { display: block; }
+
+        .settings-inner {
+            max-width: 48rem;
+            margin: 0 auto;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 1rem;
+            align-items: center;
+        }
+
+        .setting-group {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+        }
+
+        .setting-group label {
+            font-size: 0.8rem;
+            color: var(--fg-secondary);
+            font-weight: 500;
+            white-space: nowrap;
+        }
+
+        .setting-group input {
+            width: 72px;
+            padding: 0.3rem 0.5rem;
+            border: 1px solid var(--border);
+            border-radius: 0.375rem;
+            font-size: 0.8rem;
+            outline: none;
+            background: var(--bg);
+            color: var(--fg);
+            transition: border-color 0.15s;
+        }
+
+        .setting-group input:focus {
+            border-color: var(--accent);
+            box-shadow: 0 0 0 2px var(--accent-light);
+        }
+
+        /* ========== Chat Area ========== */
+        .chat-container {
+            flex: 1;
+            overflow-y: auto;
+            background-color: var(--bg);
+        }
+
+        .chat-wrapper {
+            max-width: 48rem;
+            margin: 0 auto;
+            padding: 2rem 1.5rem 3rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+
+        /* Welcome */
+        .welcome {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 4rem 1rem;
+            gap: 0.75rem;
+            color: var(--fg-secondary);
+        }
+
+        .welcome-icon {
+            font-size: 2.5rem;
+            opacity: 0.6;
+        }
+
+        .welcome h2 {
+            font-size: 1.1rem;
+            font-weight: 500;
+            margin: 0;
+            color: var(--fg);
+        }
+
+        .welcome p {
+            font-size: 0.875rem;
+            margin: 0;
+            text-align: center;
+            line-height: 1.6;
+        }
+
+        /* Messages */
+        .message {
+            display: flex;
+            justify-content: flex-start;
+            margin-bottom: 0.5rem;
+            color: #0d0d0d;
+        }
+
+        .message.assistant { justify-content: flex-start; }
+        .message.user { justify-content: flex-end; }
+
+        .message-content {
+            white-space: pre-wrap;
+            line-height: 1.6;
+            max-width: 100%;
+        }
+
+        .message.assistant .message-content {
+            background: transparent;
+            border: none;
+            cursor: pointer;
+            border-radius: 0.5rem;
+            padding: 0.5rem;
+            margin-left: -0.5rem;
+            transition: background-color 0.15s ease;
+        }
+
+        .message.assistant .message-content:hover {
+            background-color: var(--assistant-hover);
+        }
+
+        .message.user .message-content {
+            background-color: var(--user-bubble);
+            border-radius: 1.25rem;
+            padding: 0.8rem 1rem;
+            max-width: 65%;
+            cursor: pointer;
+            transition: background-color 0.15s ease;
+        }
+
+        .message.user .message-content:hover {
+            background-color: var(--user-bubble-hover);
+        }
+
+        .message.console .message-content {
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Consolas', monospace;
+            font-size: 0.8rem;
+            background-color: var(--console-bg);
+            padding: 0.6rem 0.85rem;
+            color: var(--console-fg);
+            max-width: 80%;
+            border-radius: 0.5rem;
+            border: 1px solid var(--border);
+        }
+
+        /* ========== Input ========== */
+        .input-container {
+            background-color: var(--bg);
+            padding: 1rem;
+            padding-bottom: calc(1rem + env(safe-area-inset-bottom));
+        }
+
+        .input-wrapper {
+            max-width: 48rem;
+            margin: 0 auto;
+            display: flex;
+            gap: 0.75rem;
+            align-items: flex-end;
+        }
+
+        .chat-input {
+            flex: 1;
+            padding: 0.8rem 1rem;
+            border: 1px solid var(--border-hover);
+            border-radius: 0.75rem;
+            background-color: var(--bg);
+            color: var(--fg);
+            font-size: 1rem;
+            line-height: 1.5;
+            resize: none;
+            outline: none;
+            min-height: 54px;
+            max-height: 200px;
+            transition: border-color 0.15s ease, box-shadow 0.15s ease;
+        }
+
+        .chat-input::placeholder { color: #9ca3af; }
+
+        .chat-input:focus {
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px var(--accent-light);
+        }
+
+        .send-button {
+            flex-shrink: 0;
+            width: 54px;
+            height: 54px;
+            padding: 0;
+            border: 1px solid var(--btn-bg);
+            border-radius: 0.75rem;
+            background-color: var(--btn-bg);
+            color: #ffffff;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+
+        .send-button:hover:not(:disabled) {
+            background-color: var(--btn-bg-hover);
+            border-color: var(--btn-bg-hover);
+        }
+
+        .send-button:disabled {
+            cursor: not-allowed;
+            border-color: var(--btn-disabled-border);
+            background-color: var(--btn-disabled-bg);
+            color: var(--btn-disabled-fg);
+        }
+
+        /* ========== Typing ========== */
+        .typing-indicator {
+            display: inline-block;
+            color: var(--fg-secondary);
+            letter-spacing: 0.15em;
+        }
+
+        .typing-indicator::after {
+            content: '···';
+            animation: typing 1.4s infinite;
+        }
+
+        @keyframes typing {
+            0%, 60%, 100% { opacity: 0.2; }
+            30% { opacity: 1; }
+        }
+
+        .error-message {
+            background-color: var(--error-bg);
+            border: 1px solid var(--error-border);
+            color: var(--error-fg);
+            padding: 0.6rem 0.85rem;
+            border-radius: 0.6rem;
+            font-size: 0.875rem;
+        }
+
+        /* ========== Token Counter ========== */
+        .token-info {
+            text-align: center;
+            font-size: 0.7rem;
+            color: var(--fg-secondary);
+            opacity: 0.6;
+            margin-top: -0.25rem;
+            padding-bottom: 0.25rem;
+        }
+    </style>
+</head>
+<body>
+    <!-- Header -->
+    <div class="header">
+        <div class="header-left">
+            <h1>SFT Chat</h1>
+            <span class="header-badge" id="modelBadge">loading...</span>
+        </div>
+        <div class="header-right">
+            <button class="icon-btn" onclick="toggleSettings()" title="Settings">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="12" cy="12" r="3"></circle>
+                    <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"></path>
+                </svg>
+            </button>
+            <button class="icon-btn" onclick="newConversation()" title="New Conversation (Ctrl+Shift+N)">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M12 5v14"></path>
+                    <path d="M5 12h14"></path>
+                </svg>
+            </button>
+        </div>
+    </div>
+
+    <!-- Settings -->
+    <div class="settings-panel" id="settingsPanel">
+        <div class="settings-inner">
+            <div class="setting-group">
+                <label>Temperature</label>
+                <input type="number" id="settingTemp" value="0.3" min="0" max="2" step="0.1">
+            </div>
+            <div class="setting-group">
+                <label>Top-K</label>
+                <input type="number" id="settingTopK" value="40" min="0" max="200" step="1">
+            </div>
+            <div class="setting-group">
+                <label>Top-P</label>
+                <input type="number" id="settingTopP" value="0.9" min="0" max="1" step="0.05">
+            </div>
+            <div class="setting-group">
+                <label>Max Tokens</label>
+                <input type="number" id="settingMaxTokens" value="512" min="1" max="4096" step="64">
+            </div>
+        </div>
+    </div>
+
+    <!-- Chat Messages -->
+    <div class="chat-container" id="chatContainer">
+        <div class="chat-wrapper" id="chatWrapper">
+            <div class="welcome" id="welcomeMessage">
+                <div class="welcome-icon">💬</div>
+                <h2>SFT Chat</h2>
+                <p>自定义 SFT 模型在线测试<br>输入 /help 查看可用命令</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Input -->
+    <div class="input-container">
+        <div class="input-wrapper">
+            <textarea
+                id="chatInput"
+                class="chat-input"
+                placeholder="输入消息..."
+                rows="1"
+                onkeydown="handleKeyDown(event)"
+            ></textarea>
+            <button id="sendButton" class="send-button" onclick="sendMessage()" disabled>
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M22 2L11 13"></path>
+                    <path d="M22 2l-7 20-4-9-9-4 20-7z"></path>
+                </svg>
+            </button>
+        </div>
+    </div>
+
+    <script>
+        const API_URL = '';
+        const chatContainer = document.getElementById('chatContainer');
+        const chatWrapper = document.getElementById('chatWrapper');
+        const chatInput = document.getElementById('chatInput');
+        const sendButton = document.getElementById('sendButton');
+        const welcomeMessage = document.getElementById('welcomeMessage');
+        const settingsPanel = document.getElementById('settingsPanel');
+
+        let messages = [];
+        let isGenerating = false;
+
+        // ========== Settings ==========
+        function toggleSettings() {
+            settingsPanel.classList.toggle('open');
+        }
+
+        function getSettings() {
+            return {
+                temperature: parseFloat(document.getElementById('settingTemp').value) || 0.3,
+                top_k: parseInt(document.getElementById('settingTopK').value) || 40,
+                top_p: parseFloat(document.getElementById('settingTopP').value) || 0.9,
+                max_tokens: parseInt(document.getElementById('settingMaxTokens').value) || 512,
+            };
+        }
+
+        // ========== Input Auto-resize ==========
+        chatInput.addEventListener('input', function() {
+            this.style.height = 'auto';
+            this.style.height = Math.min(this.scrollHeight, 200) + 'px';
+            sendButton.disabled = !this.value.trim() || isGenerating;
+        });
+
+        function handleKeyDown(event) {
+            if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault();
+                sendMessage();
+            }
+        }
+
+        document.addEventListener('keydown', function(event) {
+            if (event.ctrlKey && event.shiftKey && event.key === 'N') {
+                event.preventDefault();
+                if (!isGenerating) newConversation();
+            }
+        });
+
+        // ========== New Conversation ==========
+        function newConversation() {
+            messages = [];
+            chatWrapper.innerHTML = '';
+            // Re-add welcome
+            const w = document.createElement('div');
+            w.className = 'welcome';
+            w.id = 'welcomeMessage';
+            w.innerHTML = `
+                <div class="welcome-icon">💬</div>
+                <h2>SFT Chat</h2>
+                <p>自定义 SFT 模型在线测试<br>输入 /help 查看可用命令</p>
+            `;
+            chatWrapper.appendChild(w);
+            chatInput.value = '';
+            chatInput.style.height = 'auto';
+            sendButton.disabled = false;
+            isGenerating = false;
+            chatInput.focus();
+        }
+
+        // ========== Messages ==========
+        function hideWelcome() {
+            const w = document.getElementById('welcomeMessage');
+            if (w) w.remove();
+        }
+
+        function addMessage(role, content, messageIndex = null) {
+            hideWelcome();
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${role}`;
+
+            const contentDiv = document.createElement('div');
+            contentDiv.className = 'message-content';
+            contentDiv.textContent = content;
+
+            if (role === 'user' && messageIndex !== null) {
+                contentDiv.setAttribute('data-message-index', messageIndex);
+                contentDiv.setAttribute('title', '点击编辑并重新发送');
+                contentDiv.addEventListener('click', function() {
+                    if (!isGenerating) editMessage(messageIndex);
+                });
+            }
+
+            if (role === 'assistant' && messageIndex !== null) {
+                contentDiv.setAttribute('data-message-index', messageIndex);
+                contentDiv.setAttribute('title', '点击重新生成');
+                contentDiv.addEventListener('click', function() {
+                    if (!isGenerating) regenerateMessage(messageIndex);
+                });
+            }
+
+            messageDiv.appendChild(contentDiv);
+            chatWrapper.appendChild(messageDiv);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+            return contentDiv;
+        }
+
+        function editMessage(messageIndex) {
+            if (messageIndex < 0 || messageIndex >= messages.length) return;
+            const msg = messages[messageIndex];
+            if (msg.role !== 'user') return;
+
+            chatInput.value = msg.content;
+            chatInput.style.height = 'auto';
+            chatInput.style.height = Math.min(chatInput.scrollHeight, 200) + 'px';
+
+            messages = messages.slice(0, messageIndex);
+            const allMsgs = chatWrapper.querySelectorAll('.message');
+            for (let i = messageIndex; i < allMsgs.length; i++) allMsgs[i].remove();
+
+            sendButton.disabled = false;
+            chatInput.focus();
+        }
+
+        // ========== Generation ==========
+        async function generateAssistantResponse() {
+            isGenerating = true;
+            sendButton.disabled = true;
+
+            const assistantContent = addMessage('assistant', '');
+            assistantContent.innerHTML = '<span class="typing-indicator"></span>';
+
+            const settings = getSettings();
+
+            try {
+                const response = await fetch(`${API_URL}/chat/completions`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        messages: messages,
+                        temperature: settings.temperature,
+                        top_k: settings.top_k,
+                        top_p: settings.top_p,
+                        max_tokens: settings.max_tokens,
+                    }),
+                });
+
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let fullResponse = '';
+                assistantContent.textContent = '';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    const chunk = decoder.decode(value);
+                    const lines = chunk.split('\n');
+
+                    for (const line of lines) {
+                        if (line.startsWith('data: ')) {
+                            try {
+                                const data = JSON.parse(line.slice(6));
+                                if (data.token) {
+                                    fullResponse += data.token;
+                                    assistantContent.textContent = fullResponse;
+                                    chatContainer.scrollTop = chatContainer.scrollHeight;
+                                }
+                            } catch (e) {}
+                        }
+                    }
+                }
+
+                const assistantIdx = messages.length;
+                messages.push({ role: 'assistant', content: fullResponse });
+
+                assistantContent.setAttribute('data-message-index', assistantIdx);
+                assistantContent.setAttribute('title', '点击重新生成');
+                assistantContent.addEventListener('click', function() {
+                    if (!isGenerating) regenerateMessage(assistantIdx);
+                });
+
+            } catch (error) {
+                console.error('Error:', error);
+                assistantContent.innerHTML = `<div class="error-message">Error: ${error.message}</div>`;
+            } finally {
+                isGenerating = false;
+                sendButton.disabled = !chatInput.value.trim();
+            }
+        }
+
+        async function regenerateMessage(messageIndex) {
+            if (messageIndex < 0 || messageIndex >= messages.length) return;
+            if (messages[messageIndex].role !== 'assistant') return;
+
+            messages = messages.slice(0, messageIndex);
+            const allMsgs = chatWrapper.querySelectorAll('.message');
+            for (let i = messageIndex; i < allMsgs.length; i++) allMsgs[i].remove();
+
+            await generateAssistantResponse();
+        }
+
+        // ========== Slash Commands ==========
+        function handleSlashCommand(command) {
+            const parts = command.trim().split(/\s+/);
+            const cmd = parts[0].toLowerCase();
+            const arg = parts[1];
+
+            if (cmd === '/temperature' || cmd === '/temp') {
+                const el = document.getElementById('settingTemp');
+                if (arg === undefined) {
+                    addMessage('console', `Temperature: ${el.value}`);
+                } else {
+                    const v = parseFloat(arg);
+                    if (isNaN(v) || v < 0 || v > 2) {
+                        addMessage('console', '无效的 temperature，范围 0.0 ~ 2.0');
+                    } else {
+                        el.value = v;
+                        addMessage('console', `Temperature → ${v}`);
+                    }
+                }
+                return true;
+            }
+            if (cmd === '/topk') {
+                const el = document.getElementById('settingTopK');
+                if (arg === undefined) {
+                    addMessage('console', `Top-K: ${el.value}`);
+                } else {
+                    const v = parseInt(arg);
+                    if (isNaN(v) || v < 0 || v > 200) {
+                        addMessage('console', '无效的 top-k，范围 0 ~ 200');
+                    } else {
+                        el.value = v;
+                        addMessage('console', `Top-K → ${v}`);
+                    }
+                }
+                return true;
+            }
+            if (cmd === '/topp') {
+                const el = document.getElementById('settingTopP');
+                if (arg === undefined) {
+                    addMessage('console', `Top-P: ${el.value}`);
+                } else {
+                    const v = parseFloat(arg);
+                    if (isNaN(v) || v < 0 || v > 1) {
+                        addMessage('console', '无效的 top-p，范围 0.0 ~ 1.0');
+                    } else {
+                        el.value = v;
+                        addMessage('console', `Top-P → ${v}`);
+                    }
+                }
+                return true;
+            }
+            if (cmd === '/max' || cmd === '/maxtokens') {
+                const el = document.getElementById('settingMaxTokens');
+                if (arg === undefined) {
+                    addMessage('console', `Max Tokens: ${el.value}`);
+                } else {
+                    const v = parseInt(arg);
+                    if (isNaN(v) || v < 1 || v > 4096) {
+                        addMessage('console', '无效的 max tokens，范围 1 ~ 4096');
+                    } else {
+                        el.value = v;
+                        addMessage('console', `Max Tokens → ${v}`);
+                    }
+                }
+                return true;
+            }
+            if (cmd === '/clear') {
+                newConversation();
+                return true;
+            }
+            if (cmd === '/help') {
+                addMessage('console',
+                    '可用命令:\n' +
+                    '/temperature [v]  — 查看/设置 temperature (0~2)\n' +
+                    '/topk [v]         — 查看/设置 top-k (0~200)\n' +
+                    '/topp [v]         — 查看/设置 top-p (0~1)\n' +
+                    '/max [v]          — 查看/设置 max tokens (1~4096)\n' +
+                    '/clear            — 清空对话\n' +
+                    '/help             — 显示帮助\n' +
+                    '\n提示: 点击消息可编辑(用户)/重新生成(助手)'
+                );
+                return true;
+            }
+            return false;
+        }
+
+        // ========== Send ==========
+        async function sendMessage() {
+            const message = chatInput.value.trim();
+            if (!message || isGenerating) return;
+
+            if (message.startsWith('/')) {
+                chatInput.value = '';
+                chatInput.style.height = 'auto';
+                if (handleSlashCommand(message)) return;
+            }
+
+            chatInput.value = '';
+            chatInput.style.height = 'auto';
+
+            const userIdx = messages.length;
+            messages.push({ role: 'user', content: message });
+            addMessage('user', message, userIdx);
+
+            await generateAssistantResponse();
+        }
+
+        // ========== Init ==========
+        sendButton.disabled = false;
+        chatInput.focus();
+
+        fetch(`${API_URL}/health`)
+            .then(r => r.json())
+            .then(data => {
+                console.log('Health:', data);
+                const badge = document.getElementById('modelBadge');
+                if (data.ready) {
+                    const name = (data.base_model || '').split('/').pop();
+                    badge.textContent = name + (data.lora ? ' + LoRA' : '');
+                } else {
+                    badge.textContent = 'not ready';
+                    badge.style.background = '#ef4444';
+                }
+            })
+            .catch(error => {
+                console.error('Health check failed:', error);
+                document.getElementById('modelBadge').textContent = 'offline';
+                document.getElementById('modelBadge').style.background = '#ef4444';
+                chatWrapper.innerHTML = '<div class="error-message" style="margin:2rem auto;max-width:400px;text-align:center;">服务未启动，请先运行 python chat_web.py</div>';
+            });
+    </script>
+</body>
+</html>
