@@ -6,7 +6,7 @@ from lora import apply_lora, load_lora_weights
 # ============================================================
 # 配置
 # ============================================================
-BASE_MODEL = "Qwen/Qwen2.5-0.5B"
+BASE_MODEL = "Qwen/Qwen2.5-1.5B"
 
 USE_LORA = True
 LORA_PATH = "out/sft/lora_best.pt"
@@ -52,9 +52,7 @@ def load_model():
 # 对话接口
 # ============================================================
 def chat_once(prompt, model, tokenizer, history=None, debug=False):
-    """单次对话生成"""
-    messages = [{"role": "system", "content": "You are a helpful assistant."}]
-
+    messages = []
     if history:
         for user_msg, bot_msg in history:
             messages.append({"role": "user", "content": user_msg})
@@ -99,13 +97,6 @@ def chat_once(prompt, model, tokenizer, history=None, debug=False):
         print(f"  {new_ids.tolist()[:30]}{'...' if len(new_ids) > 30 else ''}")
         print(f"  解码: {repr(tokenizer.decode(new_ids, skip_special_tokens=False)[:200])}")
 
-        # 检查是否生成了 <|im_end|>
-        if im_end_id in new_ids.tolist():
-            pos = new_ids.tolist().index(im_end_id)
-            print(f"  \033[92m✓ 在位置 {pos} 生成了 <|im_end|>\033[0m")
-        else:
-            print(f"  \033[91m✗ 未生成 <|im_end|>，跑满了 {len(new_ids)} tokens\033[0m")
-
     response = tokenizer.decode(new_ids, skip_special_tokens=True)
     return response.strip()
 
@@ -113,9 +104,8 @@ def chat_once(prompt, model, tokenizer, history=None, debug=False):
 # ============================================================
 # 测试
 # ============================================================
-def interactive_chat(model, tokenizer):
+def chat(model, tokenizer):
     print("\n" + "=" * 60)
-    print("  交互式对话")
     print("  quit=退出, clear=清空历史, debug=切换调试, test=固定测试")
     print("=" * 60)
 
@@ -152,7 +142,7 @@ def interactive_chat(model, tokenizer):
 
 def main():
     model, tokenizer = load_model()
-    interactive_chat(model, tokenizer)
+    chat(model, tokenizer)
 
 
 if __name__ == "__main__":

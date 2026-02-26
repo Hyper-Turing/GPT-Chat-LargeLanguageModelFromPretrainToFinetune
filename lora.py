@@ -45,17 +45,16 @@ class LoRALinear(nn.Module):
 
     def forward(self, x):
         # 原始路径 Wx
-        base_out  = F.linear(x, self.weight, self.bias)
+        base_out = F.linear(x, self.weight, self.bias)
         x_lora = self.lora_dropout(x)
 
         # LoRA 旁路: x @ A^T @ B^T * scaling
-        if x_lora.dtype != torch.float32:
-            x_lora = x_lora.to(torch.float32)
-            lora_out = F.linear(F.linear(x_lora, self.lora_A), self.lora_B)
-            # 转回原始 dtype
-            lora_out = lora_out.to(base_out.dtype)
-        else:
-            lora_out = F.linear(F.linear(x_lora, self.lora_A), self.lora_B)
+        lora_A = self.lora_A.float()
+        lora_B = self.lora_B.float()
+        x_lora = x_lora.float()
+        lora_out = F.linear(F.linear(x_lora, lora_A), lora_B)
+        # 转回原始 dtype
+        lora_out = lora_out.to(base_out.dtype)
 
         return base_out + lora_out * self.scaling
     

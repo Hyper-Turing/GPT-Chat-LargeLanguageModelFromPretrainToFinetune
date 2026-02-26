@@ -23,6 +23,8 @@ class SFTDataset:
     def __init__(self, filepath: str, tokenizer):
         self.filepath = filepath
         self.tokenizer = tokenizer
+        # 使用字符串字面量替代特殊字符
+        self.im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
         with open(filepath, "r", encoding="utf-8") as f:
             self.data = [json.loads(line) for line in f if line.strip()]
 
@@ -39,9 +41,10 @@ class SFTDataset:
         item = self.data[idx]
         messages = item["conversations"]
 
+        # 返回 BatchEncoding(字典), 需要提取 input_ids
         full_ids = self.tokenizer.apply_chat_template(
             messages, tokenize=True, add_special_tokens=False
-        )
+        )["input_ids"]
 
         # 定位 assistant 边界
         loss_mask = [0] * len(full_ids)
@@ -56,14 +59,14 @@ class SFTDataset:
             prefix_ids = self.tokenizer.apply_chat_template(
                 messages[:i], tokenize=True, add_generation_prompt=True,
                 add_special_tokens=False,
-            )
+            )["input_ids"]
             prefix_len = len(prefix_ids) # assistant回复开始的位置
 
             # assistant回复的消息
             assistant_ids = self.tokenizer.apply_chat_template(
                 messages[:i + 1], tokenize=True, add_generation_prompt=False,
                 add_special_tokens=False,
-            )
+            )["input_ids"]
             end_pos = len(assistant_ids) # assistant回复结束的位置
 
             # chatML 中, assistant的回复是:
@@ -120,7 +123,7 @@ def sft_data_generator(
     epoch = 0
 
     def _next_index():
-        # 提前预取下一个数据索 
+        # 提前预取下一个数据索引
         # 自动循环防止超出数据集
         nonlocal cursor, epoch
         if cursor >= len(indices):

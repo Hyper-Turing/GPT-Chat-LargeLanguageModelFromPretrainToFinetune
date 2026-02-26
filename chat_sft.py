@@ -12,14 +12,15 @@ from gpt import GPT
 from dataset import SFTDataset, sft_data_generator, IGNORE_TOKEN_ID
 from lora import apply_lora, mark_only_lora_as_trainable, lora_state_dict
 import checkpoint_manager as ckpt_mgr
+import wandb
 
 # ======================================================================
 # 命令行参数
 # ======================================================================
 parser = argparse.ArgumentParser(description="GPT-CHAT-SFT")
-parser.add_argument("--model-name", type=str, default="Qwen/Qwen2.5-0.5B")
+parser.add_argument("--model-name", type=str, default="Qwen/Qwen2.5-1.5B")
 parser.add_argument("--data-path", type=str, default="data/sft/sft_data.jsonl")
-parser.add_argument("--num-iterations", type=int, default=2000)
+parser.add_argument("--num-iterations", type=int, default=4000)
 parser.add_argument("--learning-rate", type=float, default=2e-4)
 parser.add_argument("--batch-size", type=int, default=4)
 parser.add_argument("--lora-r", type=int, default=16)
@@ -31,7 +32,7 @@ mode.add_argument("--resume", action="store_true", help="恢复训练")
 args = parser.parse_args()
 
 
-MAX_SEQ_LEN = 1024
+MAX_SEQ_LEN = 512
 GRAD_ACCUM_STEPS = 8
 VAL_RATIO = 0.01
 LOG_EVERY = 10
@@ -81,9 +82,11 @@ def prepare_data_split(data_path, out_dir):
 def get_lr(it, max_iters, warmup_iters, learning_rate):
     min_lr = learning_rate * 0.1
     if it < warmup_iters:
+        # Warmup 阶段：线性增长
         return learning_rate * (it + 1) / (warmup_iters + 1)
-    if it > max_iters:
+    if it >= max_iters:
         return min_lr
+    # Cosine decay 阶段
     ratio = (it - warmup_iters) / (max_iters - warmup_iters)
     coeff = 0.5 * (1.0 + math.cos(math.pi * ratio))
     return min_lr + coeff * (learning_rate - min_lr)
@@ -146,17 +149,25 @@ def main():
     train_dataset = SFTDataset(train_path, tokenizer)
     val_dataset = SFTDataset(val_path, tokenizer)
 
-    # 自动计算的训练参数
-    steps_per_epoch = max(1, len(train_dataset) // eff_batch)
-    eval_every = max(100, steps_per_epoch // 3)
-    checkpoint_every = eval_every * 5
-    warmup_iters = args.num_iterations // 50
+    # 基于 token 数量计算训练参数
+    # 每个 step 处理的 token 数
+    tokens_per_step = eff_batch * MAX_SEQ_LEN
+    total_train_tokens = args.num_iterations * tokens_per_step
+
+    # 评估频率：每处理 10% 的 tokens 评估一次
+    eval_every_tokens = total_train_tokens // 10
+    eval_every = max(100, eval_every_tokens // tokens_per_step)
+    checkpoint_every = eval_every * 3
+    # warmup：前 5% 的 tokens 用于 warmup
+    warmup_tokens = total_train_tokens // 20
+    warmup_iters = max(10, warmup_tokens // tokens_per_step)
+    # eval_steps: 每次评估采样约 1/10 的验证数据
     eval_steps = max(1, len(val_dataset) // (args.batch_size * 10))
 
     print(f"model: {args.model_name} | device: {device} | batch: {eff_batch} | "
-          f"iters: {args.num_iterations} | lr: {args.learning_rate} | "
-          f"train: {len(train_dataset)} | val: {len(val_dataset)} | "
-          f"eval_every: {eval_every} | LoRA r={args.lora_r}")
+          f"iters: {args.num_iterations} | tokens: {total_train_tokens//1e6:.1f}M | "
+          f"lr: {args.learning_rate} | train nums: {len(train_dataset)} | val nums: {len(val_dataset)} | "
+          f"eval_every: {eval_every} | warmup: {warmup_iters} | LoRA r={args.lora_r}")
 
     # 数据生成器
     def build_loader(dataset, shuffle=True):
@@ -201,6 +212,17 @@ def main():
     # 训练
     os.makedirs(args.out_dir, exist_ok=True)
 
+    try:
+        wandb.init(project="GPT-Chat-SFT", config={
+            "model": args.model_name, "lr": args.learning_rate,
+            "batch_size": eff_batch, "max_seq_len": MAX_SEQ_LEN,
+            "lora_r": args.lora_r, "lora_alpha": lora_alpha,
+            "num_iterations": args.num_iterations,
+            "train_size": len(train_dataset), "val_size": len(val_dataset),
+        })
+    except Exception as e:
+        print(f"wandb 初始化失败: {e}")
+
     while step < args.num_iterations:
         lr = get_lr(step, args.num_iterations, warmup_iters, args.learning_rate)
         for pg in optimizer.param_groups:
@@ -224,6 +246,11 @@ def main():
             mark = "✓" if improved else f"✗ patience {patience_cnt}/{args.patience}"
             print(f"[eval] step {step} | val_loss={val_loss:.4f} | "
                   f"best={best_val_loss:.4f} | {mark}")
+
+            try:
+                wandb.log({"val/loss": val_loss, "val/best_loss": best_val_loss}, step=step)
+            except Exception:
+                pass
 
             if args.patience > 0 and patience_cnt >= args.patience:
                 print(f"早停触发, best_val_loss={best_val_loss:.4f}")
@@ -255,6 +282,10 @@ def main():
 
         if step % LOG_EVERY == 0:
             print(f"[train] step {step:05d} | loss {accum_loss:.4f} | lr {lr:.2e} | {dt*1000:.0f}ms")
+            try:
+                wandb.log({"train/loss": accum_loss, "train/lr": lr}, step=step)
+            except Exception:
+                pass
 
         step += 1
 
@@ -262,6 +293,10 @@ def main():
     torch.save(lora_state_dict(model), os.path.join(args.out_dir, "lora_final.pt"))
     ckpt_mgr.save(args.out_dir, step, model, optimizer, best_val_loss, patience_cnt, args)
     print(f"训练完成, best_val_loss={best_val_loss:.4f}")
+    try:
+        wandb.finish()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
